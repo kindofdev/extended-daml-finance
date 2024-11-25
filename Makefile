@@ -1,5 +1,5 @@
-.PHONY: build
-build:
+.PHONY: build-all
+build-all:
 	# daml build --all  # every now and then it fails - the workaround above seems to work when vscode keeps closed.
 	cd src/extended-daml-finance-interface-account; daml build; cd ../..;
 	cd src/extended-daml-finance-interface-settlement; daml build; cd ../..;
@@ -15,7 +15,7 @@ clean:
 	daml clean --all
 
 .PHONY: test
-test: build
+test: build-all
 	daml test --project-root ./src/extended-daml-finance-settlement-test
 	daml test --project-root ./src/extended-daml-finance-account-test
 	daml test --project-root ./src/extended-daml-finance-app
