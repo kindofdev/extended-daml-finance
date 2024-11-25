@@ -1,0 +1,32 @@
+# Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+sdk-version: 2.9.4
+name: extended-daml-finance-app
+version: 0.1.0
+source: daml
+dependencies:
+- daml-prim
+- daml-stdlib
+- daml-script
+data-dependencies:
+  - ../../lib/daml-finance-account-3.0.0.dar
+  - ../../lib/daml-finance-holding-3.0.0.dar
+  - ../../lib/daml-finance-instrument-token-3.0.0.dar
+  - ../../lib/daml-finance-interface-account-3.0.0.dar
+  - ../../lib/daml-finance-interface-holding-3.0.0.dar
+  - ../../lib/daml-finance-interface-instrument-base-3.0.0.dar
+  - ../../lib/daml-finance-interface-instrument-token-3.0.0.dar
+  - ../../lib/daml-finance-interface-instrument-types-1.0.0.dar
+  - ../../lib/daml-finance-interface-settlement-3.0.0.dar
+  - ../../lib/daml-finance-interface-types-common-2.0.0.dar
+  - ../../lib/daml-finance-interface-util-2.1.0.dar
+  - ../../lib/daml-finance-settlement-3.0.0.dar
+  - ../../lib/daml-finance-util-3.1.0.dar
+  - ../extended-daml-finance-interface-settlement/.daml/dist/extended-daml-finance-interface-settlement-0.1.0.dar
+  - ../extended-daml-finance-interface-account/.daml/dist/extended-daml-finance-interface-account-0.1.0.dar
+  - ../extended-daml-finance-settlement/.daml/dist/extended-daml-finance-settlement-0.1.0.dar
+  - ../extended-daml-finance-account/.daml/dist/extended-daml-finance-account-0.1.0.dar
+  - ../extended-daml-finance-test-util/.daml/dist/extended-daml-finance-test-util-0.1.0.dar
+
+

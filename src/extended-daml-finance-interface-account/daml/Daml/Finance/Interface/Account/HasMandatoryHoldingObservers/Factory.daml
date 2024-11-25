@@ -1,0 +1,51 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Daml.Finance.Interface.Account.HasMandatoryHoldingObservers.Factory where
+
+import Daml.Finance.Interface.Account.Account qualified as Account (Controllers(..))
+import Daml.Finance.Interface.Account.HasMandatoryHoldingObservers.HasMandatoryHoldingObservers (MandatoryHoldingObservers(..))
+
+import Daml.Finance.Interface.Account.HasMandatoryHoldingObservers.HasMandatoryHoldingObservers qualified as HasMandatoryHoldingObservers (I)
+import Daml.Finance.Interface.Types.Common.Types (AccountKey(..), HoldingFactoryKey, PartiesMap)
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (I)
+
+-- | Type synonym for `Factory`.
+type I = Factory
+
+-- | Type synonym for `View`.
+type V = View
+
+-- View of `Factory`.
+data View = View
+  with
+    provider : Party
+      -- ^ The provider of the `Factory`.
+  deriving (Eq, Show)
+
+-- | Interface that allows the implementitation of templates to create accounts
+-- with mandatory holding's observers.
+interface Factory requires Disclosure.I where
+  viewtype V
+
+  create' : Create -> Update (ContractId HasMandatoryHoldingObservers.I)
+    -- ^ Implementation of `Create` choice.
+
+  nonconsuming choice Create : ContractId HasMandatoryHoldingObservers.I
+    -- ^ Create a new account.
+    with
+      account : AccountKey
+        -- ^ The account's key.
+      holdingFactory : HoldingFactoryKey
+        -- ^ Associated holding factory for the account.
+      controllers : Account.Controllers
+        -- ^ Controllers of the account.
+      description : Text
+        -- ^ Human readable description of the account.
+      observers : PartiesMap
+        -- ^ The account's observers.
+      mandatoryHoldingObservers : MandatoryHoldingObservers
+        -- ^ The mandatory holding's observers.
+    controller account.custodian, account.owner
+    do
+      create' this arg

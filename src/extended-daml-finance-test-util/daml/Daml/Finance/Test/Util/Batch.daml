@@ -1,0 +1,67 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Daml.Finance.Test.Util.Batch where
+
+import DA.Set qualified as Set (singleton)
+
+import Daml.Finance.Interface.Holding.Holding qualified as Holding (I)
+import Daml.Finance.Interface.Settlement.Batch qualified as Batch (Cancel(..), I, Settle(..))
+import Daml.Finance.Interface.Settlement.DisclosureBatchFactory qualified as SettlementDisclosureBatchFactory (I)
+import Daml.Finance.Interface.Settlement.Instruction qualified as Instruction (Allocate(..), Approve(..), I)
+import Daml.Finance.Interface.Settlement.Types (Allocation(..), Approval(..))
+import Daml.Finance.Interface.Types.Common.Types (AccountKey, Parties)
+import Daml.Finance.Settlement.Transfer.SettlementFactory qualified as Settlement (Factory(..))
+import Daml.Finance.Test.Util.Common (discloseContract)
+import Daml.Script
+
+
+createSettlementDisclosureBatchFactory
+  :  Parties
+  -> Party
+  -> Script (ContractId SettlementDisclosureBatchFactory.I, Disclosure)
+createSettlementDisclosureBatchFactory observers provider = do
+  factoryCid <- toInterfaceContractId <$> submit provider do
+    createCmd Settlement.Factory with provider; observers
+  factoryDisclosed <- discloseContract @Settlement.Factory provider factoryCid
+  pure (factoryCid, factoryDisclosed)
+
+settle
+  :  Party
+  -> [Disclosure]
+  -> ContractId Batch.I
+  -> Script [ContractId Holding.I]
+settle settler disclosed batchCid =
+  submitWithDisclosures settler disclosed do
+    exerciseCmd batchCid Batch.Settle with actors = Set.singleton settler
+
+settleMustFail
+  :  Party
+  -> [Disclosure]
+  -> ContractId Batch.I
+  -> Script ()
+settleMustFail settler disclosed batchCid =
+  submitWithDisclosuresMustFail settler disclosed do
+    exerciseCmd batchCid Batch.Settle with actors = Set.singleton settler
+
+cancel : Party -> ContractId Batch.I -> Script [ContractId Holding.I]
+cancel actor batchCid =
+  submit actor do
+    exerciseCmd batchCid Batch.Cancel with actors = Set.singleton actor
+
+cancelMustFail : Party -> ContractId Batch.I -> Script ()
+cancelMustFail actor batchCid =
+  submitMustFail actor do
+    exerciseCmd batchCid Batch.Cancel with actors = Set.singleton actor
+
+takeDelivery : Party -> AccountKey -> ContractId Instruction.I -> Script (ContractId Instruction.I)
+takeDelivery actor account instructionCid =
+  submit actor do
+    exerciseCmd instructionCid Instruction.Approve with
+      actors = Set.singleton actor; approval = TakeDelivery account
+
+pledge : Party -> ContractId Holding.I -> ContractId Instruction.I -> Script (ContractId Instruction.I)
+pledge actor holdingCid instructionCid =
+  fst <$> submit actor do
+    exerciseCmd instructionCid Instruction.Allocate with
+      actors = Set.singleton actor; allocation = Pledge holdingCid

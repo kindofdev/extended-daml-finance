@@ -1,0 +1,145 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+{-# LANGUAGE AllowAmbiguousTypes #-}
+
+module Daml.Finance.Settlement.Transfer.Test.Util where
+
+import DA.Tuple (thd3, snd3, fst3)
+
+import Daml.Finance.Interface.Account.Factory qualified as AccountFactory (I)
+import Daml.Finance.Interface.Holding.Holding qualified as Holding (I)
+import Daml.Finance.Interface.Settlement.DisclosureBatchFactory qualified as SettlementDisclosureBatchFactory (I)
+import Daml.Finance.Interface.Settlement.Transfer.Types (TransferProposalFactoryKey(..))
+import Daml.Finance.Interface.Types.Common.Types
+  ( HoldingFactoryKey
+  , AccountKey
+  , HoldingStandard(..)
+  , InstrumentKey
+  , Parties
+  )
+import Daml.Finance.Test.Util.Account qualified as Account
+  ( ControlledBy(..)
+  , credit
+  , createAccount
+  , createFactoryAndDiclosure
+  )
+import Daml.Finance.Test.Util.Batch qualified as Batch (createSettlementDisclosureBatchFactory)
+import Daml.Finance.Test.Util.HoldingFactory qualified as Holding (createFactoryAndDiclosures)
+import Daml.Finance.Test.Util.Instrument (originate)
+import Daml.Finance.Test.Util.TransferProposal qualified as TransferProposal (createFactory)
+import Daml.Script
+
+
+data TestParties = TestParties
+  with
+    operator : Party
+    sender : Party
+    receiver : Party
+    custodianA : Party
+    custodianB : Party
+    rootCustodian : Party
+    issuer : Party
+    sAgent : Party
+    regulator : Party
+  deriving (Eq, Show)
+
+setupParties : Script TestParties
+setupParties = do
+  operator <- allocateParty "Operator"
+  sender <- allocateParty "Sender"
+  receiver <- allocateParty "Receiver"
+  custodianA <- allocateParty "CustodianA"
+  custodianB <- allocateParty "CustodianB"
+  rootCustodian <- allocateParty "RootCustodian"
+  issuer <- allocateParty "Issuer"
+  sAgent <- allocateParty "SettlementAgent"
+  regulator <- allocateParty "Regulator"
+  pure TestParties with ..
+
+-- | Initial test state.
+data TestInitialState = TestInitialState
+  with
+    tpFactoryKey : TransferProposalFactoryKey
+    settlementFactoryCid : ContractId SettlementDisclosureBatchFactory.I
+    euro : InstrumentKey
+    senderAccount : AccountKey
+    receiverAccount : AccountKey
+    custodianAAccount : AccountKey
+    custodianBAccount : AccountKey
+    senderHoldingCid : ContractId Holding.I
+    custodianAHoldingCid : ContractId Holding.I
+    createTransferProposalDisclosures : [Disclosure]
+    settlementFactoryDisclosed : Disclosure
+    settleBatchDisclosures : [Disclosure]
+    accountRFactoryCid : ContractId AccountFactory.I
+    holdingFactoryRKey : HoldingFactoryKey
+
+setupInitialState : TestParties -> Script TestInitialState
+setupInitialState
+  TestParties
+    { operator
+    ; sender
+    ; receiver
+    ; custodianA
+    ; custodianB
+    ; rootCustodian
+    ; issuer
+    ; sAgent
+    ; regulator
+    } = do
+  -- Factories
+  (tpFactoryKey, tpFactoryRefDisclosed, tpFactoryDisclosed) <-
+    TransferProposal.createFactory "testId" mempty operator
+  let createTransferProposalDisclosures = [tpFactoryRefDisclosed, tpFactoryDisclosed]
+  (settlementFactoryCid, settlementFactoryDisclosed) <-
+    Batch.createSettlementDisclosureBatchFactory mempty sAgent
+
+  [(accountAFactoryCid, _), (accountBFactoryCid, _), (accountRFactoryCid, _)] <-
+    forA [custodianA, custodianB, rootCustodian] $ Account.createFactoryAndDiclosure "accountFactory" mempty
+  [  (holdingFactoryAKey, _, _)
+   , (holdingFactoryBKey, holdingFactoryRefBDisclosed, holdingFactoryBDisclosed)
+   , (holdingFactoryRKey, holdingFactoryRefRDisclosed, holdingFactoryRDisclosed)
+   ] <- forA [custodianA, custodianB, rootCustodian] $ Holding.createFactoryAndDiclosures "holdingFactory" mempty
+
+  let
+    settleBatchDisclosures =
+      [ holdingFactoryRefBDisclosed
+      , holdingFactoryBDisclosed
+      , holdingFactoryRefRDisclosed
+      , holdingFactoryRDisclosed
+      ]
+
+  -- Accounts
+  [senderAccount, receiverAccount, custodianAAccount, custodianBAccount] <-
+    createAccounts
+      [ (custodianA,    (accountAFactoryCid, holdingFactoryAKey), [(sender, Account.Owner, "test")])
+      , (custodianB,    (accountBFactoryCid, holdingFactoryBKey), [(receiver, Account.Owner, "test")])
+      , (rootCustodian, (accountRFactoryCid, holdingFactoryRKey), [ (custodianA, Account.Owner, "test")
+                                                                  , (custodianB, Account.Owner, "test")
+                                                                  ])
+      ]
+  -- Instruments
+  euro <- originateInstrument issuer issuer "EUR" "Euro" []
+  -- Holdings
+  senderHoldingCid <- Account.credit [] euro 10.0 senderAccount
+  custodianAHoldingCid <- Account.credit [] euro 10.0 custodianAAccount
+  pure TestInitialState with ..
+
+createAccounts
+  : [(Party, (ContractId AccountFactory.I, HoldingFactoryKey), [(Party, Account.ControlledBy, Text)])]
+  -> Script [AccountKey]
+createAccounts custodiansFactoriesCustomers = do
+  let
+    custodians = fst3 <$> custodiansFactoriesCustomers
+    factories = snd3 <$> custodiansFactoriesCustomers
+    customers = thd3 <$> custodiansFactoriesCustomers
+  mconcat <$> forA (zip3 custodians factories customers)
+    \(custodian, (accountFactoryCid, holdingFactoryKey), customersPerCustodian) -> forA customersPerCustodian $
+      \(customer, controlledBy, desc) ->
+        Account.createAccount desc [] accountFactoryCid holdingFactoryKey [] controlledBy custodian customer
+
+originateInstrument : Party -> Party -> Text -> Text -> [(Text, Parties)] -> Script InstrumentKey
+originateInstrument depository issuer id desc observers = do
+  now <- getTime
+  originate depository issuer id  TransferableFungible desc [] now

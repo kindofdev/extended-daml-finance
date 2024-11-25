@@ -1,0 +1,19 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Daml.Finance.Interface.Settlement.DisclosureBatch where
+
+import Daml.Finance.Interface.Settlement.Batch qualified as Batch (I)
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (I)
+
+-- | Type synonym for `DisclosureBatch`.
+type I = DisclosureBatch
+
+-- | Type synonym for `View`.
+type V = View
+
+data View = View {}
+
+-- | An interface for a `Batch` that supports disclosure.
+interface DisclosureBatch requires Batch.I, Disclosure.I where
+  viewtype V

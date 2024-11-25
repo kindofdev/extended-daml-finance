@@ -1,0 +1,15 @@
+# Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+sdk-version: 2.9.4
+name: extended-daml-finance-interface-account
+version: 0.1.0
+source: daml
+dependencies:
+- daml-prim
+- daml-stdlib
+- daml-script
+data-dependencies:
+  - ../../lib/daml-finance-interface-account-3.0.0.dar
+  - ../../lib/daml-finance-interface-types-common-2.0.0.dar
+  - ../../lib/daml-finance-interface-util-2.1.0.dar

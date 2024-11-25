@@ -1,0 +1,227 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Daml.Finance.Settlement.Transfer.TransferProposal where
+
+import DA.Action (unless)
+import DA.Foldable (forA_)
+import DA.Map qualified as Map (keys, lookup)
+import DA.Optional (catOptionals)
+import DA.Set qualified as Set (difference, fromList, insert, notMember, singleton)
+
+import Daml.Finance.Interface.Account.Account qualified as Account (undisclose)
+import Daml.Finance.Interface.Holding.Holding qualified as Holding (I)
+import Daml.Finance.Interface.Settlement.Batch qualified as Batch (Cancel(..), I, Settle(..))
+import Daml.Finance.Interface.Settlement.DisclosureBatch qualified as DisclosureBatch (I)
+import Daml.Finance.Interface.Settlement.DisclosureBatchFactory qualified as SettlementDisclosureBatchFactory (I, Instruct(..))
+import Daml.Finance.Interface.Settlement.Instruction qualified as Instruction (Allocate(..), Approve(..), GetView(..), I)
+import Daml.Finance.Interface.Settlement.Transfer.Types
+  ( DisclosedAccount
+  , DisclosedHolding
+  , Instructed(..)
+  , PreAllocationApprovalOpsData(..)
+  , PreAllocationOpType(..)
+  , PreApprovalOpType(..)
+  , RoutedStepWithPreAllocationApprovalOpsMap
+  , getDisclosedAccounts
+  , getDisclosedHoldings
+  )
+import Daml.Finance.Interface.Settlement.Types (Allocation(..), Approval(..))
+import Daml.Finance.Interface.Types.Common.Types (Id(..), InstrumentQuantity, PartiesMap, Id, Parties)
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure
+  ( AddObservers(..)
+  , I
+  , RemoveObservers(..)
+  , View(..)
+  , flattenObservers
+  )
+import Daml.Finance.Interface.Settlement.Transfer.TransferProposal qualified as TransferProposal
+  ( Authorize(..)
+  , Cancel(..)
+  , Instruct(..)
+  , I
+  , Settle(..)
+  , View(..)
+  )
+import Daml.Finance.Settlement.Transfer.Util (validatePreAllocationApprovalOps)
+import Daml.Finance.Util.Disclosure (addObserversImpl, removeObserversImpl, setObserversImpl)
+
+-- | Type synonym for `TransferProposal`.
+type T = TransferProposal
+
+template TransferProposal
+  with
+    proposer : Party
+    authorizers : Parties
+    alreadyAuthorized : Parties
+    settlers : Parties
+    id : Id
+    description : Text
+    settlementTime : Optional Time
+    quantity : InstrumentQuantity
+    routedStepsMap : RoutedStepWithPreAllocationApprovalOpsMap
+    instructed : Instructed
+    settlementFactoryCid : ContractId SettlementDisclosureBatchFactory.I
+    observers : PartiesMap
+    extraBatchObservers : Parties
+    batchConsenters : Parties
+  where
+    signatory proposer, alreadyAuthorized
+    observer settlers, authorizers, Disclosure.flattenObservers observers
+
+    interface instance Disclosure.I for TransferProposal where
+      view = Disclosure.View with
+        disclosureControllers = Set.singleton proposer; observers
+      setObservers = setObserversImpl @TransferProposal @Disclosure.I this None
+      addObservers = addObserversImpl @TransferProposal @Disclosure.I this None
+      removeObservers = removeObserversImpl @TransferProposal @Disclosure.I this None
+
+    interface instance TransferProposal.I for TransferProposal where
+      view = TransferProposal.View with
+        proposer
+        authorizers
+        alreadyAuthorized
+        settlers
+        id
+        description
+        settlementTime
+        quantity
+        routedStepsMap
+        instructed
+        extraBatchObservers
+        batchConsenters
+
+      authorize TransferProposal.Authorize{authorizer; preAllocationApprovalOps} = do
+        mustNotBeInstructed this
+        assertMsg (show authorizer <> " has already authorized") $
+          authorizer `Set.notMember` alreadyAuthorized
+        let signatories = proposer `Set.insert` authorizers
+
+        updateRoutedStepsMap <-
+          validatePreAllocationApprovalOps
+            authorizer
+            signatories
+            quantity
+            routedStepsMap
+            preAllocationApprovalOps
+
+        toInterfaceContractId @TransferProposal.I <$>
+          create this with
+            alreadyAuthorized = authorizer `Set.insert` alreadyAuthorized
+            routedStepsMap = updateRoutedStepsMap
+
+      cancel TransferProposal.Cancel{actor} = do
+        disclosedHoldingCids <- case instructed of
+          Instructed batchCid -> do
+            -- Cancel batch
+            holdingCids <- exercise batchCid Batch.Cancel with actors = Set.fromList (signatory this)
+            pure $  zip holdingCids (snd <$> (getDisclosedHoldings routedStepsMap))
+          NotInstructed -> do
+            pure $ getDisclosedHoldings routedStepsMap
+        undiscloseAccounts actor (getDisclosedAccounts routedStepsMap)
+        undiscloseHoldings actor disclosedHoldingCids
+
+      settle TransferProposal.Settle = do
+        batchCid <- mustBeInstructed this
+        undiscloseAccounts proposer (getDisclosedAccounts routedStepsMap)
+        exercise batchCid Batch.Settle with actors = settlers
+
+      instruct TransferProposal.Instruct{actor} = do
+        unless (alreadyAuthorized == authorizers) $
+          abort $ "Authorizations missing: " <> show (Set.difference authorizers alreadyAuthorized)
+        mustNotBeInstructed this
+
+        -- Batch/Instructions creation
+        let routedSteps = Map.keys routedStepsMap
+        (batchCid, instructionCids) <-
+          exercise settlementFactoryCid SettlementDisclosureBatchFactory.Instruct with
+            instructor = proposer
+            consenters = batchConsenters
+            settlers
+            id = Id $ "transfer-batch:" <> show id
+            description = "transfer-batch:" <> description
+            contextId = Some id
+            routedSteps
+            settlementTime
+
+        -- Allocation/approval of pre-allocated/approved instructions
+        instructionPreAllocApprCids <- forA instructionCids \instructionCid -> do
+          rs <- (.routedStep) <$> exercise instructionCid Instruction.GetView with viewer = proposer
+          case Map.lookup rs routedStepsMap of
+            None -> abort "Unexpected routedStep not found in routedStepsMap"
+            Some a -> case a of
+              PreAllocationApprovalOpsData{optPreAllocationOp = None; optPreApprovalOp = None} ->
+                pure instructionCid
+              PreAllocationApprovalOpsData{optPreAllocationOp = Some (alloc, allocActors); optPreApprovalOp = Some (appr, apprActors)} ->
+                allocateInstruction allocActors alloc instructionCid >>= approveInstruction apprActors appr
+              PreAllocationApprovalOpsData{optPreAllocationOp = Some (alloc, allocActors); optPreApprovalOp = None} ->
+                allocateInstruction allocActors alloc instructionCid
+              PreAllocationApprovalOpsData{optPreAllocationOp = None; optPreApprovalOp = Some (appr, apprActors)} ->
+                approveInstruction apprActors appr instructionCid
+
+        -- Disclose batch
+        let observersToAdd = ("extraBatchObservers", extraBatchObservers)
+        batchDiclosedCid <- toInterfaceContractId @Batch.I . fromInterfaceContractId @DisclosureBatch.I <$>
+          exercise (toInterfaceContractId @Disclosure.I batchCid)
+            Disclosure.AddObservers with
+              disclosers = Set.singleton proposer
+              observersToAdd
+        -- Diclose instructions
+        instructionDisclosedCids <- forA instructionPreAllocApprCids $ \cid -> do
+          disclosedCid <- exercise (toInterfaceContractId @Disclosure.I cid)
+            Disclosure.AddObservers with
+              disclosers = Set.singleton proposer
+              observersToAdd
+          pure $ fromInterfaceContractId @Instruction.I disclosedCid
+
+        updatedCid <- toInterfaceContractId <$>
+          create this with instructed = Instructed batchDiclosedCid
+        pure (batchDiclosedCid, instructionDisclosedCids, updatedCid)
+
+
+mustNotBeInstructed : T -> Update ()
+mustNotBeInstructed this = case this.instructed of
+  NotInstructed       -> pure ()
+  Instructed batchCid -> abort "Transfer proposal was already instructed"
+
+mustBeInstructed : T -> Update (ContractId Batch.I)
+mustBeInstructed this = case this.instructed of
+  NotInstructed       -> abort "Transfer proposal has not been instructed yet"
+  Instructed batchCid -> pure batchCid
+
+undiscloseAccounts : Party -> [DisclosedAccount] -> Update ()
+undiscloseAccounts discloser disclosedAccounts =
+  forA_ disclosedAccounts \(accountKey, observersToRemove) ->
+    Account.undisclose observersToRemove discloser (Set.singleton discloser) accountKey
+
+undiscloseHoldings : Party -> [DisclosedHolding] -> Update [ContractId Holding.I]
+undiscloseHoldings discloser disclosedHoldings =
+  fmap fromInterfaceContractId . catOptionals <$>
+    forA disclosedHoldings \(cid, observersToRemove)  ->
+      exercise (toInterfaceContractId @Disclosure.I cid) Disclosure.RemoveObservers with
+         disclosers = (Set.singleton discloser)
+         observersToRemove
+
+allocateInstruction
+  :  Parties
+  -> PreAllocationOpType
+  -> ContractId Instruction.I
+  -> Update (ContractId Instruction.I)
+allocateInstruction actors preAllocOp cid = fst <$>
+  exercise cid Instruction.Allocate with
+    actors
+    allocation = case preAllocOp of
+      (PrePledge holdingCid) -> Pledge holdingCid
+      PreCreditReceiver -> CreditReceiver
+
+approveInstruction
+  :  Parties
+  -> PreApprovalOpType
+  -> ContractId Instruction.I
+  -> Update (ContractId Instruction.I)
+approveInstruction actors preApprOp cid =
+  exercise cid Instruction.Approve with
+    actors
+    approval = case preApprOp of
+      (PreTakeDelivery accountKey) -> TakeDelivery accountKey
+      PreDebitSender               -> DebitSender

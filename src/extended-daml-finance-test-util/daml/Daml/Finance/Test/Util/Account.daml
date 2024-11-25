@@ -1,0 +1,219 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+{-# LANGUAGE AllowAmbiguousTypes #-}
+
+module Daml.Finance.Test.Util.Account where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.List (head)
+import DA.Map qualified as Map (values, fromList)
+import DA.Optional (fromSome)
+import DA.Set qualified as Set (fromList, singleton)
+
+import Daml.Finance.Account.Account qualified as Account (Factory(..))
+import Daml.Finance.Interface.Account.HasMandatoryHoldingObservers.HasMandatoryHoldingObservers (MandatoryHoldingObservers(..))
+import Daml.Finance.Account.HasMandatoryHoldingObservers.Account qualified as AccountHasMandatoryHoldingObservers (Factory(..))
+import Daml.Finance.Interface.Account.Account qualified as Account (Controllers(..), Credit(..), Debit(..), GetCid(..), I, R)
+import Daml.Finance.Interface.Account.Factory qualified as AccountFactory (Create(..), I)
+import Daml.Finance.Interface.Account.HasMandatoryHoldingObservers.Factory qualified as AccountHasMandatoryHoldingObserversFactory (Create(..), I)
+import Daml.Finance.Interface.Holding.Holding qualified as Holding (GetView(..), I)
+import Daml.Finance.Interface.Types.Common.Types (PartiesMap, AccountKey(..), HoldingFactoryKey, Id(..), InstrumentKey, Parties)
+import Daml.Finance.Interface.Util.Common (qty)
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (GetView(..), I)
+import Daml.Finance.Test.Util.Common
+  ( submitExerciseInterfaceByKeyCmdHelper
+  , submitExerciseInterfaceByKeyCmdWithDisclosuresHelper
+  , submitMustFailExerciseInterfaceByKeyCmdHelper
+  )
+import Daml.Script
+
+-- | Options for transfer controllers.
+data ControlledBy
+  = Owner
+    -- ^ Owner controls inbound and outbound transfers.
+  | Custodian
+    -- ^ Custodian controls inbound and outbound transfers.
+  | OwnerAndCustodian
+    -- ^ Owner and custodian jointly control inbound and outbound transfers.
+  | OwnerWithAutoApproval
+    -- ^ Owner controls outbound transfers, and inbound transfers are auto-approved.
+  deriving (Eq, Show)
+
+-- | Get account controllers depending on controlledBy.
+toControllers : Party -> Party -> ControlledBy -> Account.Controllers
+toControllers custodian owner controlledBy =
+  case controlledBy of
+    Owner -> Account.Controllers with
+      outgoing = Set.singleton owner; incoming = Set.singleton owner
+    Custodian -> Account.Controllers with
+      outgoing = Set.singleton custodian; incoming = Set.singleton custodian
+    OwnerAndCustodian -> Account.Controllers with
+      outgoing = Set.fromList [owner, custodian]; incoming = Set.fromList [owner, custodian]
+    OwnerWithAutoApproval -> Account.Controllers with
+      outgoing = Set.singleton owner; incoming = mempty
+
+-- | Create factory for `Account`.
+createFactory : Party -> [(Text, Parties)] -> Script (ContractId Account.Factory)
+createFactory provider observers = submit provider do
+  createCmd Account.Factory with provider; observers = Map.fromList observers
+
+-- | Create factory for `Account` which `HasMandatoryHoldingObservers`.
+createHasMandatoryHoldingObserversFactory
+  :  Party
+  -> [(Text, Parties)]
+  -> Script (ContractId AccountHasMandatoryHoldingObservers.Factory)
+createHasMandatoryHoldingObserversFactory provider observers = submit provider do
+  createCmd AccountHasMandatoryHoldingObservers.Factory with provider; observers = Map.fromList observers
+
+-- | Create factory for `Account` and return disclosed factory.
+createFactoryAndDiclosure
+  :  Text
+  -> [(Text, Parties)]
+  -> Party
+  -> Script (ContractId AccountFactory.I, Disclosure)
+createFactoryAndDiclosure id observers provider = do
+  factoryCid <- createFactory provider observers
+  factoryDisclosed <- fromSome <$> queryDisclosure provider factoryCid
+  pure (toInterfaceContractId @AccountFactory.I factoryCid, factoryDisclosed)
+
+-- | Create factory for `Account` which `HasMandatoryHoldingObservers` and return disclosed factory.
+createHasMandatoryHoldingObserversFactoryAndDiclosure
+  :  Text
+  -> [(Text, Parties)]
+  -> Party
+  -> Script (ContractId AccountHasMandatoryHoldingObserversFactory.I, Disclosure)
+createHasMandatoryHoldingObserversFactoryAndDiclosure id observers provider = do
+  factoryCid <- createHasMandatoryHoldingObserversFactory provider observers
+  factoryDisclosed <- fromSome <$> queryDisclosure provider factoryCid
+  pure (toInterfaceContractId @AccountHasMandatoryHoldingObserversFactory.I factoryCid, factoryDisclosed)
+
+-- | Create `Account`.
+createAccount
+  :  Text
+  -> [Party]
+  -> ContractId AccountFactory.I
+  -> HoldingFactoryKey
+  -> [(Text, Parties)]
+  -> ControlledBy
+  -> Party
+  -> Party
+  -> Script AccountKey
+createAccount description readAs accountFactoryCid holdingFactory observers controlledBy custodian
+  owner = do
+    let
+      account = AccountKey with
+        custodian; owner; id = Id $ show owner <> "@" <> show custodian <> "/" <> description
+    submitMulti [custodian, owner] readAs do
+      exerciseCmd accountFactoryCid AccountFactory.Create with
+        account; holdingFactory; controllers = toControllers custodian owner controlledBy
+        observers = Map.fromList observers; description
+    pure account
+
+-- | Create `Account` which `HasMandatoryHoldingObservers`.
+createAccountWithMandatoryHoldingObservers
+  :  Text
+  -> [Party]
+  -> ContractId AccountHasMandatoryHoldingObserversFactory.I
+  -> HoldingFactoryKey
+  -> [(Text, Parties)]
+  -> ControlledBy
+  -> MandatoryHoldingObservers
+  -> Party
+  -> Party
+  -> Script AccountKey
+createAccountWithMandatoryHoldingObservers description readAs accountFactoryCid
+  holdingFactory observers controlledBy mandatoryHoldingObservers custodian owner = do
+    let
+      account = AccountKey with
+        custodian; owner; id = Id $ show owner <> "@" <> show custodian <> "/" <> description
+    submitMulti [custodian, owner] readAs do
+      exerciseCmd accountFactoryCid AccountHasMandatoryHoldingObserversFactory.Create with
+        account; holdingFactory; controllers = toControllers custodian owner controlledBy
+        observers = Map.fromList observers; description; mandatoryHoldingObservers
+    pure account
+
+-- | Credit an `Account`.
+credit : [Party] -> InstrumentKey -> Decimal -> AccountKey -> Script (ContractId Holding.I)
+credit readAs instrument amount account =
+  submitExerciseInterfaceByKeyCmdHelper @Account.R @Account.I [account.custodian, account.owner]
+  readAs account
+  (Account.GetCid with viewer = account.owner)
+  (Account.Credit with quantity = qty amount instrument)
+
+-- | Verify that Credit an `Account` fails.
+creditMustFail : [Party] -> InstrumentKey -> Decimal -> AccountKey -> Script ()
+creditMustFail readAs instrument amount account =
+  submitMustFailExerciseInterfaceByKeyCmdHelper @Account.R @Account.I
+    [account.custodian, account.owner]
+    readAs
+    account
+    (Account.GetCid with viewer = account.owner)
+    (Account.Credit with quantity = qty amount instrument)
+
+-- | Debit an `Account`.
+debit : [Party] -> Party -> ContractId Holding.I -> Script ()
+debit readAs holder holdingCid = do
+  v <- submit holder do exerciseCmd holdingCid Holding.GetView with viewer = holder
+  v.account.owner === holder
+  submitExerciseInterfaceByKeyCmdHelper @Account.R @Account.I
+    [v.account.custodian, holder] readAs v.account
+    (Account.GetCid with viewer = holder) (Account.Debit with holdingCid)
+
+-- | Credit an `Account` using Diclosures.
+creditWithDisclosures : [Disclosure] -> InstrumentKey -> Decimal -> AccountKey -> Script (ContractId Holding.I)
+creditWithDisclosures disclosed instrument amount account =
+  submitExerciseInterfaceByKeyCmdWithDisclosuresHelper @Account.R @Account.I [account.custodian, account.owner]
+    [] disclosed account
+    (Account.GetCid with viewer = account.owner)
+    (Account.Credit with quantity = qty amount instrument)
+
+getAccountObservers : [Party] -> AccountKey -> Script PartiesMap
+getAccountObservers readAs accountKey = do
+  let owner = accountKey.owner
+  (.observers) <$> submitExerciseInterfaceByKeyCmdHelper @Account.R @Disclosure.I [owner]
+    readAs accountKey
+    (Account.GetCid with viewer = owner)
+    (Disclosure.GetView with viewer = owner)
+
+verifyAccountNoObservers : [AccountKey] -> Script ()
+verifyAccountNoObservers accounts =
+  verifyAccountObservers ([]: [Party]) accounts
+
+verifyAccountObservers : IsParties p => p  -> [AccountKey] -> Script ()
+verifyAccountObservers p accounts = do
+  forA_ accounts
+    \accountKey -> do
+      observers <- getAccountObservers [] accountKey
+      mconcat (Map.values observers) === Set.fromList (toParties p)
+
+-- | Utilty function for exercising an interface by key.
+submitExerciseInterfaceByKeyCmd : forall t2 c2 b.
+  ( HasInterfaceTypeRep t2
+  , HasTemplateTypeRep t2
+  , HasToAnyTemplate t2
+  , HasFromAnyTemplate t2
+  , HasFromAnyChoice t2 c2 b
+  , HasToAnyChoice t2 c2 b
+  , HasExercise t2 c2 b
+  )
+  => [Party] -> [Party] -> AccountKey -> c2 -> Script b
+submitExerciseInterfaceByKeyCmd actAs readAs k arg =
+  submitExerciseInterfaceByKeyCmdHelper @Account.R @t2 actAs readAs k
+    (Account.GetCid with viewer = head actAs) arg
+
+-- | Utilty function for exercising an interface by key.
+submitMustFailExerciseInterfaceByKeyCmd : forall t2 c2 b.
+  ( HasInterfaceTypeRep t2
+  , HasTemplateTypeRep t2
+  , HasToAnyTemplate t2
+  , HasFromAnyTemplate t2
+  , HasFromAnyChoice t2 c2 b
+  , HasToAnyChoice t2 c2 b
+  , HasExercise t2 c2 b
+  )
+  => [Party] -> [Party] -> AccountKey -> c2 -> Script ()
+submitMustFailExerciseInterfaceByKeyCmd actAs readAs k arg =
+  submitMustFailExerciseInterfaceByKeyCmdHelper @Account.R @t2 actAs readAs k
+    (Account.GetCid with viewer = head actAs) arg

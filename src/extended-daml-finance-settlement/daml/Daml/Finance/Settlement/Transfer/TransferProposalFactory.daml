@@ -1,0 +1,114 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Daml.Finance.Settlement.Transfer.TransferProposalFactory where
+
+import DA.Foldable qualified as F (null)
+import DA.Map qualified as Map (fromList)
+import DA.List qualified as L (unique)
+import DA.Set qualified as Set (insert, isSubsetOf, null, singleton)
+
+import Daml.Finance.Interface.Settlement.RouteProvider qualified as RouteProvider (Discover(..), I)
+import Daml.Finance.Interface.Settlement.Transfer.TransferProposalFactory qualified as TransferProposalFactory
+  ( Create(..), I, View(..), disclosureUpdateReference, transferProposalFactoryKey )
+import Daml.Finance.Interface.Settlement.Transfer.Types
+  ( Instructed(..)
+  , TransferData(..)
+  , initializeRoutedStepMap
+  )
+import Daml.Finance.Settlement.Hierarchy qualified as DamlFinance (Hierarchy(..))
+import Daml.Finance.Interface.Settlement.Types (Step(..))
+import Daml.Finance.Interface.Types.Common.Types (Id, PartiesMap)
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (I, View(..), flattenObservers)
+import Daml.Finance.Settlement.RouteProvider.IntermediatedStatic (IntermediatedStatic(..))
+import Daml.Finance.Settlement.Transfer.TransferProposal (TransferProposal(..))
+import Daml.Finance.Settlement.Transfer.Util (findNewDiclosedHolding, validatePreAllocationApprovalOps)
+import Daml.Finance.Util.Disclosure (addObserversImpl, removeObserversImpl, setObserversImpl)
+
+
+template Factory
+  with
+    provider : Party
+      -- ^ Party providing the facility.
+    id : Id
+      -- ^ Identifier for the factory.
+    observers : PartiesMap
+      -- ^ The factory's observers.
+  where
+    signatory provider
+    observer Disclosure.flattenObservers observers
+
+    interface instance TransferProposalFactory.I for Factory where
+      view = TransferProposalFactory.View with provider; id
+      getKey = TransferProposalFactory.transferProposalFactoryKey this
+      create' TransferProposalFactory.Create
+        { proposer; authorizers; settlers
+        ; id; description; settlementTime; transferData
+        ; preAllocationApprovalOps
+        ; extraBatchObservers
+        ; batchConsenters
+        ; settlementFactoryCid
+        } = do
+          assertMsg "At least a settler is needed" $ not (Set.null settlers)
+          assertMsg "batchConsenters must be a subset of authorizers" $
+            batchConsenters `Set.isSubsetOf` authorizers
+          let
+            TransferData{sender; receiver; quantity; hierarchy} = transferData
+            damlFinanceHierarchy = DamlFinance.Hierarchy with
+              rootCustodian = hierarchy.rootCustodian
+              pathsToRootCustodian = hierarchy.pathsToRootCustodian
+            step = Step with sender; receiver; quantity
+            paths = Map.fromList [(show quantity.unit.id, damlFinanceHierarchy)]
+            instructionsSignatories = proposer `Set.insert` authorizers
+
+          routeProviderCid <- toInterfaceContractId @RouteProvider.I <$>
+            create IntermediatedStatic with provider = proposer; paths; observers = mempty
+          routedSteps <- exercise routeProviderCid RouteProvider.Discover with
+            discoverors = Set.singleton proposer; contextId = None; steps = [step]
+          archive routeProviderCid
+
+          -- Sanity checks
+          assertMsg "routedSteps generated must not be an empty list." $
+            not . F.null $ routedSteps
+          assertMsg "routedSteps generated must be unique." $
+            L.unique routedSteps
+          assertMsg "routedSteps generated must have the same quantity." $
+            all (\rs -> rs.quantity == quantity) routedSteps
+
+          let initialRoutedStepsMap = initializeRoutedStepMap routedSteps
+          routedStepsMap <-
+            validatePreAllocationApprovalOps
+              proposer
+              instructionsSignatories
+              quantity
+              initialRoutedStepsMap
+              preAllocationApprovalOps
+
+          -- Get disclosed holding if so
+          optDisclosedHoldingCid <- findNewDiclosedHolding initialRoutedStepsMap routedStepsMap
+
+          tpCid <- toInterfaceContractId <$> create TransferProposal with
+            proposer
+            authorizers
+            alreadyAuthorized = mempty
+            settlers
+            id
+            description
+            settlementTime
+            settlementFactoryCid
+            quantity
+            routedStepsMap
+            instructed = NotInstructed
+            extraBatchObservers
+            batchConsenters
+            observers = mempty
+          pure (tpCid, optDisclosedHoldingCid)
+
+    interface instance Disclosure.I for Factory where
+      view = Disclosure.View with disclosureControllers = Set.singleton provider; observers
+      setObservers = setObserversImpl this . Some . TransferProposalFactory.disclosureUpdateReference $
+        TransferProposalFactory.transferProposalFactoryKey this
+      addObservers = addObserversImpl this . Some . TransferProposalFactory.disclosureUpdateReference $
+        TransferProposalFactory.transferProposalFactoryKey this
+      removeObservers = removeObserversImpl this . Some . TransferProposalFactory.disclosureUpdateReference $
+        TransferProposalFactory.transferProposalFactoryKey this

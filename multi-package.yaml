@@ -1,0 +1,9 @@
+packages:
+- src/extended-daml-finance-interface-account
+- src/extended-daml-finance-interface-settlement
+- src/extended-daml-finance-account
+- src/extended-daml-finance-settlement
+- src/extended-daml-finance-test-util
+- src/extended-daml-finance-settlement-test
+- src/extended-daml-finance-account-test
+- src/extended-daml-finance-app

@@ -1,0 +1,599 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+{-# LANGUAGE AllowAmbiguousTypes #-}
+
+module Daml.Finance.Settlement.Transfer.Test.TransferProposal where
+
+import DA.Action (foldlA)
+import DA.Foldable (forA_)
+import DA.Functor (void)
+import DA.List qualified as L (head, last, tail)
+import DA.Set qualified as Set (fromList, insert, singleton, toList)
+
+import Daml.Finance.Holding.TransferableFungible qualified as Holding (TransferableFungible)
+import Daml.Finance.Interface.Settlement.Transfer.TransferProposalFactory qualified as TransferProposalFactory (Create(..))
+import Daml.Finance.Interface.Settlement.Transfer.Types
+  ( Hierarchy(..)
+  , TransferData(..)
+  , mkPreCreditReceiver
+  , mkPreDebitSender
+  , mkPrePledge
+  , mkPreTakeDelivery
+  )
+import Daml.Finance.Interface.Types.Common.Types (AccountKey, InstrumentQuantity, Parties, Id(..))
+import Daml.Finance.Interface.Util.Common (qty)
+import Daml.Finance.Settlement.Transfer.Batch (Batch)
+import Daml.Finance.Settlement.Transfer.Instruction (Instruction)
+import Daml.Finance.Settlement.Transfer.TransferProposal (TransferProposal)
+import Daml.Finance.Settlement.Transfer.Test.Util
+import Daml.Finance.Test.Util.Account qualified as Account
+  ( ControlledBy(..)
+  , credit
+  , verifyAccountNoObservers
+  , verifyAccountObservers
+  )
+import Daml.Finance.Test.Util.Batch qualified as Batch (cancelMustFail, pledge, takeDelivery)
+import Daml.Finance.Test.Util.Common
+  ( verifySignatories
+  , verifyObservers
+  , verifyAreObserverMembers
+  )
+import Daml.Finance.Test.Util.Holding qualified as Holding (verifyNoObservers, verifyOwnerOfHolding)
+import Daml.Finance.Test.Util.TransferProposal qualified as TransferProposal
+  ( authorize
+  , authorizeMustFail
+  , cancel
+  , cancelMustFail
+  , create
+  , createMustFail
+  , instruct
+  , instructMustFail
+  , settle
+  , settleMustFail
+  )
+import Daml.Script
+
+
+-- +----------------------------+
+-- | Accounts structure         |
+-- +----------------------------+
+-- |      rootCustodian         |
+-- |      /            \        |
+-- | custodianA    custodianB   |
+-- |      |             |       |
+-- |   sender        receiver   |
+-- +----------------------------+
+
+testCreate : Script ()
+testCreate = do
+  parties@TestParties{issuer; regulator} <- setupParties
+
+  initialState@TestInitialState
+    { tpFactoryKey
+    ; createTransferProposalDisclosures
+    } <- setupInitialState parties
+
+  let
+    TestTransferProposalData
+      { createRecord
+      ; proposer
+      ; settler
+      ; extraBatchObservers
+      ; authorizers
+      } = mkTransferProposalData parties initialState
+
+  -- proposer cannot be an authorizer
+  TransferProposal.createMustFail createTransferProposalDisclosures proposer tpFactoryKey
+    createRecord with authorizers = Set.fromList [issuer, proposer]
+  -- settlers cannot be empty
+  TransferProposal.createMustFail createTransferProposalDisclosures proposer tpFactoryKey
+    createRecord with settlers = mempty
+  -- Invalid hierarchy
+  TransferProposal.createMustFail createTransferProposalDisclosures proposer tpFactoryKey
+    createRecord with
+      transferData = createRecord.transferData with
+        sender = settler
+  -- batchConsenters must be a subset of authorizers
+  TransferProposal.createMustFail createTransferProposalDisclosures proposer tpFactoryKey
+    createRecord with batchConsenters = Set.insert regulator authorizers
+  -- Happy path
+  (tpCid, None) <-
+    TransferProposal.create createTransferProposalDisclosures proposer tpFactoryKey createRecord
+  -- Assert state
+  verifySignatories @TransferProposal proposer proposer tpCid
+  verifyObservers @TransferProposal proposer (authorizers <> (Set.singleton settler)) tpCid
+  pure ()
+
+testAuthorize : Script ()
+testAuthorize = do
+  parties@TestParties{issuer} <- setupParties
+  initialState@TestInitialState
+    { tpFactoryKey
+    ; createTransferProposalDisclosures
+    } <- setupInitialState parties
+
+  let
+    TestTransferProposalData
+      { createRecord
+      ; proposer
+      ; authorizers
+      } = mkTransferProposalData parties initialState
+
+  (tpCid, _) <-
+    TransferProposal.create createTransferProposalDisclosures proposer tpFactoryKey createRecord
+  -- Only authorizers can Authorize
+  TransferProposal.authorizeMustFail proposer mempty tpCid
+  -- Happy path - Authorize
+  let oneAuthorizer = L.head $ Set.toList authorizers
+  tpAuthorizedCid <- TransferProposal.authorize oneAuthorizer mempty tpCid
+  -- An authorizer cannot Authorize twice
+  TransferProposal.authorizeMustFail oneAuthorizer mempty tpAuthorizedCid
+  -- Assert state
+  verifySignatories @TransferProposal proposer (Set.fromList [proposer, oneAuthorizer]) tpAuthorizedCid
+  pure ()
+
+testInstruct : Script ()
+testInstruct = do
+  parties@TestParties{issuer} <- setupParties
+  initialState@TestInitialState
+    { tpFactoryKey
+    ; createTransferProposalDisclosures
+    ; settlementFactoryDisclosed
+    ; senderHoldingCid
+    } <- setupInitialState parties
+
+  let
+    TestTransferProposalData
+      { createRecord
+      ; proposer
+      ; authorizers
+      ; settler
+      ; tpSignatories
+      ; extraBatchObservers
+      } = mkTransferProposalData parties initialState
+    oneAuthorizer = L.head $ Set.toList authorizers
+    authorizersLeft = (L.tail $ Set.toList authorizers)
+    proposerHoldingCid = senderHoldingCid
+
+  (tpCid, _) <-
+    TransferProposal.create createTransferProposalDisclosures proposer tpFactoryKey createRecord
+
+  tpPartiallyAuthorizedCid <- TransferProposal.authorize oneAuthorizer mempty tpCid
+  -- Missing authorizations
+  TransferProposal.instructMustFail [settlementFactoryDisclosed] proposer tpPartiallyAuthorizedCid
+  -- Complete authorizations
+  tpFullyAuthorizedCid <-
+    foldlA (\tpCid authorizer -> TransferProposal.authorize authorizer mempty tpCid)
+      tpPartiallyAuthorizedCid authorizersLeft
+  -- Only proposer or authorizers can Instruct
+  TransferProposal.instructMustFail [settlementFactoryDisclosed] settler tpFullyAuthorizedCid
+
+  -- Happy path - proposer can Instruct
+  (_, _, tpInstructedCid) <-
+    TransferProposal.instruct [settlementFactoryDisclosed] proposer tpFullyAuthorizedCid
+  void $ TransferProposal.cancel proposer tpInstructedCid
+  -- Happy path - an authorizer can Instruct
+  (batchCid, instructionCids@[_, _, _], tpInstructedCid) <- do
+    (tpCid, Some proposerDisclosedHoldingCid) <-
+      TransferProposal.create createTransferProposalDisclosures proposer tpFactoryKey
+        createRecord with preAllocationApprovalOps = [mkPrePledge proposerHoldingCid]
+    tpFullyAuthorizedCid <-
+      foldlA (\tpCid authorizer -> TransferProposal.authorize authorizer mempty tpCid)
+        tpCid (Set.toList authorizers)
+    TransferProposal.instruct [settlementFactoryDisclosed] proposer tpFullyAuthorizedCid
+  -- An instructed TranferProposal cannot be instructed again
+  TransferProposal.instructMustFail [settlementFactoryDisclosed] proposer tpInstructedCid
+  -- An instructed TranferProposal cannot be authorized
+  TransferProposal.authorizeMustFail oneAuthorizer mempty tpInstructedCid
+
+  -- Assert state
+  verifySignatories @Batch proposer tpSignatories batchCid
+  verifyObservers @Batch proposer (settler :: Set.toList extraBatchObservers) batchCid
+  forA_ instructionCids $ \cid -> do
+    verifySignatories @Instruction proposer tpSignatories cid
+  forA_ instructionCids $
+    verifyAreObserverMembers @Instruction proposer (settler :: Set.toList extraBatchObservers)
+  pure ()
+
+testCancel : Script ()
+testCancel = do
+  parties@TestParties{sender} <- setupParties
+
+  initialState@TestInitialState
+    { tpFactoryKey
+    ; senderHoldingCid
+    ; createTransferProposalDisclosures
+    ; settlementFactoryDisclosed
+    ; euro
+    } <- setupInitialState parties
+
+  let
+    TestTransferProposalData
+      { createRecord
+      ; proposer
+      , proposerAccount
+      ; authorizers
+      ; settler
+      ; tpSignatories
+      } = mkTransferProposalData parties initialState
+    oneAuthorizer = L.head $ Set.toList authorizers
+    anotherAuthorizer = L.last $ Set.toList authorizers
+    proposerHoldingCid = senderHoldingCid
+
+  Account.verifyAccountNoObservers [proposerAccount]
+
+  --------------------------------
+  -- Cancelling before Instruct --
+  --------------------------------
+  (tpCid, Some proposerDisclosedHoldingCid) <-
+    TransferProposal.create createTransferProposalDisclosures proposer tpFactoryKey
+      createRecord with preAllocationApprovalOps = [mkPrePledge proposerHoldingCid]
+  verifyObservers @Holding.TransferableFungible proposer tpSignatories proposerDisclosedHoldingCid
+  Account.verifyAccountObservers tpSignatories [proposerAccount]
+  tpPartiallyAuthorizedCid <- TransferProposal.authorize oneAuthorizer mempty tpCid
+  -- Only proposer or authorizer can Cancel
+  TransferProposal.cancelMustFail settler tpPartiallyAuthorizedCid
+  -- Happy path - An authorizer can cancel
+  [proposerUndisclosedHoldingCid] <- TransferProposal.cancel oneAuthorizer tpPartiallyAuthorizedCid
+  verifyObservers @Holding.TransferableFungible proposer (mempty : Parties) proposerUndisclosedHoldingCid
+  Account.verifyAccountNoObservers [proposerAccount]
+  -- Happy path - Proposer can cancel
+  (tpCid, _) <-
+    TransferProposal.create createTransferProposalDisclosures proposer tpFactoryKey createRecord
+  void $ TransferProposal.cancel proposer tpCid
+
+  -------------------------------
+  -- Cancelling after Instruct --
+  -------------------------------
+  newProposerHoldingCid <- Account.credit [] euro 10.0 proposerAccount
+  (batchCid, instructionCids@[_, _, _], tpInstructedCid) <- do
+    (tpCid, Some _) <-
+      TransferProposal.create createTransferProposalDisclosures proposer tpFactoryKey
+        createRecord with preAllocationApprovalOps = [mkPrePledge newProposerHoldingCid]
+    tpFullyAuthorizedCid <-
+      foldlA (\tpCid authorizer -> TransferProposal.authorize authorizer mempty tpCid)
+        tpCid (Set.toList authorizers)
+    TransferProposal.instruct [settlementFactoryDisclosed] proposer tpFullyAuthorizedCid
+
+  -- Batch cannot be cancelled via batchCid since batch consenters permissions are missing
+  Batch.cancelMustFail proposer batchCid
+  undisclosedHoldingCids <- TransferProposal.cancel proposer tpInstructedCid
+  -- Assert state
+  Account.verifyAccountNoObservers [proposerAccount]
+  let ts = zip [sender] undisclosedHoldingCids
+  Holding.verifyOwnerOfHolding ts
+  Holding.verifyNoObservers ts
+  pure ()
+
+testSettle : Script ()
+testSettle = do
+  parties@TestParties
+    { sender
+    ; receiver
+    ; custodianA
+    ; custodianB
+    ; issuer
+    } <- setupParties
+
+  initialState@TestInitialState
+    { tpFactoryKey
+    ; senderAccount
+    ; receiverAccount
+    ; custodianAAccount
+    ; custodianBAccount
+    ; senderHoldingCid
+    ; custodianAHoldingCid
+    ; createTransferProposalDisclosures
+    ; settlementFactoryDisclosed
+    ; settleBatchDisclosures
+    } <- setupInitialState parties
+
+  let
+    TestTransferProposalData
+      { createRecord
+      ; proposer
+      , proposerAccount
+      ; settler
+      } = mkTransferProposalData parties initialState
+    proposerHoldingCid = senderHoldingCid
+    proposerAccount = senderAccount
+
+  Account.verifyAccountNoObservers [senderAccount, custodianAAccount, custodianBAccount]
+  (tpCid, Some _disclosedHoldingCid) <-
+    TransferProposal.create createTransferProposalDisclosures proposer tpFactoryKey
+      createRecord with preAllocationApprovalOps = [mkPrePledge proposerHoldingCid]
+  -- All instructions are fully allocated/approved excluding approval on "custodianB --> receiver"
+  (batchCid, [_, custodianBToReceiverInstruction, _], instructedTpCid) <-
+    TransferProposal.authorize custodianA
+      [ mkPreDebitSender
+      , mkPrePledge custodianAHoldingCid
+      ] tpCid
+    >>= TransferProposal.authorize custodianB
+      [ mkPreCreditReceiver
+      , mkPreTakeDelivery custodianBAccount
+      ]
+    >>= TransferProposal.authorize issuer mempty
+    >>= TransferProposal.instruct [settlementFactoryDisclosed] issuer
+
+  -- Missing instruction's approval (custodianB --> receiver)
+  TransferProposal.settleMustFail settler settleBatchDisclosures instructedTpCid
+  void $ Batch.takeDelivery receiver receiverAccount custodianBToReceiverInstruction
+  -- Only settler can Settle
+  TransferProposal.settleMustFail proposer settleBatchDisclosures instructedTpCid
+  transferredHoldingCids@[_, _] <- TransferProposal.settle settler settleBatchDisclosures instructedTpCid
+
+  -- Assert state
+  let ts = zip [custodianB, receiver] transferredHoldingCids
+  Holding.verifyOwnerOfHolding ts
+  Holding.verifyNoObservers ts
+  Account.verifyAccountNoObservers [senderAccount, custodianAAccount, custodianBAccount]
+  pure ()
+
+testSingleCustodianTransfer : Script ()
+testSingleCustodianTransfer = do
+  parties@TestParties
+    { custodianA
+    ; custodianB
+    ; rootCustodian
+    ; issuer
+    } <- setupParties
+
+  initialState@TestInitialState
+    { tpFactoryKey
+    ; custodianBAccount
+    ; custodianAHoldingCid
+    ; createTransferProposalDisclosures
+    ; settlementFactoryDisclosed
+    ; settleBatchDisclosures
+    } <- setupInitialState parties
+
+  let
+    TestTransferProposalData
+      { createRecord
+      ; settler
+      ; quantity
+      } = mkTransferProposalData parties initialState
+    proposer = issuer
+    authorizer = custodianB
+    authorizers = Set.singleton authorizer
+    batchConsenters = mempty
+    sender = custodianA
+    senderHoldingCid = custodianAHoldingCid
+    receiver = custodianB
+    receiverAccount = custodianBAccount
+    hierarchy = Hierarchy with
+      rootCustodian
+      pathsToRootCustodian = [[custodianA], [custodianB]]
+
+  (tpCid, None) <-
+    TransferProposal.create createTransferProposalDisclosures proposer tpFactoryKey
+      createRecord with
+        proposer
+        authorizers
+        batchConsenters
+        description = "custodianA --> custodianB transfer"
+        transferData = TransferData with
+          sender
+          receiver
+          quantity
+          hierarchy
+
+  (batchCid, [instructionCid], instructedTpCid) <- do
+    TransferProposal.authorize authorizer [mkPreTakeDelivery receiverAccount] tpCid
+    >>= TransferProposal.instruct [settlementFactoryDisclosed] authorizer
+  void $ Batch.pledge sender senderHoldingCid instructionCid
+  [transferredHoldingCid] <- TransferProposal.settle settler settleBatchDisclosures instructedTpCid
+
+  -- Assert state
+  let ts = zip [custodianB] [transferredHoldingCid]
+  Holding.verifyOwnerOfHolding ts
+  Holding.verifyNoObservers ts
+  pure ()
+
+-- Test pre-allocations/approvals in transfer proposal creation flow.
+-- Note: pre-allocations/approvals in the authorization flow has not been tested since
+-- they behaves exactly the same way as they do in the transfer proposal creation flow.
+testPreAllocationApproval : Script ()
+testPreAllocationApproval = do
+  parties@TestParties
+    { sender
+    ; receiver
+    ; custodianA
+    ; custodianB
+    ; rootCustodian
+    } <- setupParties
+
+  initialState@TestInitialState
+    { tpFactoryKey
+    ; createTransferProposalDisclosures
+    ; senderAccount
+    ; receiverAccount
+    ; senderHoldingCid
+    ; settlementFactoryCid
+    ; euro
+    ; accountRFactoryCid
+    ; holdingFactoryRKey
+    } <- setupInitialState parties
+
+  -- Create custodian's accounts at rootCustodian controlledBy Owner + Custodian
+  [custodianAAccount', custodianBAccount'] <- createAccounts
+    [ ( rootCustodian
+      , (accountRFactoryCid, holdingFactoryRKey)
+      , [(custodianA, Account.OwnerAndCustodian, "test'"), (custodianB, Account.OwnerAndCustodian, "test'")]
+      )
+    ]
+  custodianAHoldingCid' <- Account.credit [] euro 10.0 custodianAAccount'
+  custodianBHoldingCid' <- Account.credit [] euro 10.0 custodianBAccount'
+
+  let
+    TestTransferProposalData
+      { settlers
+      ; transferData
+      } = mkTransferProposalData parties initialState
+    createRecord = TransferProposalFactory.Create with
+      proposer = sender
+      authorizers = mempty
+      settlers
+      id = Id "transfer"
+      description = "sender --> receiver transfer"
+      settlementTime = None
+      transferData
+      preAllocationApprovalOps = mempty
+      extraBatchObservers = mempty
+      batchConsenters = mempty
+      settlementFactoryCid
+
+  --------------
+  --- Sender ---
+  --------------
+  let createRecord' = createRecord with proposer = sender
+  -- sender cannot take delivery (only pledge)
+  TransferProposal.createMustFail createTransferProposalDisclosures sender tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPreTakeDelivery senderAccount]
+  -- sender is not a custodian
+  TransferProposal.createMustFail createTransferProposalDisclosures sender tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPreCreditReceiver]
+  -- sender is not a custodian
+  TransferProposal.createMustFail createTransferProposalDisclosures sender tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPreDebitSender]
+  -- Invalid holding
+  TransferProposal.createMustFail createTransferProposalDisclosures sender tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPrePledge custodianAHoldingCid']
+
+  --------------------------------------
+  --- CustodianA (sender@custodianA) ---
+  --------------------------------------
+  let createRecord' = createRecord with proposer = custodianA
+  -- custodianA cannot credit since custodianA is the sender's custodian, not the receiver's custodian
+  TransferProposal.createMustFail createTransferProposalDisclosures custodianA tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPreCreditReceiver]
+  -- custodianA cannot take delivery (only pledge)
+  TransferProposal.createMustFail createTransferProposalDisclosures custodianA tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPreTakeDelivery custodianAAccount']
+  -- Invalid holding
+  TransferProposal.createMustFail createTransferProposalDisclosures custodianA tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPrePledge senderHoldingCid]
+  -- rootCustodian authorization is missing since rootCustodian is a outgoing controller in custodianAAccount'
+  TransferProposal.createMustFail createTransferProposalDisclosures custodianA tpFactoryKey
+    createRecord' with proposer = custodianA; preAllocationApprovalOps = [mkPrePledge custodianAHoldingCid']
+
+  ----------------------------------------
+  --- CustodianB (receiver@custodianB) ---
+  ----------------------------------------
+  let createRecord' = createRecord with proposer = custodianB
+  -- custodianB cannot debit since custodianB is the receiver's custodian, not the sender's custodian
+  TransferProposal.createMustFail createTransferProposalDisclosures custodianB tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPreDebitSender]
+  -- custodianB cannot tpledge (only take delivery)
+  TransferProposal.createMustFail createTransferProposalDisclosures custodianB tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPrePledge custodianBHoldingCid']
+  -- Invalid account
+  TransferProposal.createMustFail createTransferProposalDisclosures custodianB tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPreTakeDelivery receiverAccount]
+  -- rootCustodian authorization is missing since rootCustodian is a incoming controller in custodianBAccount'
+  TransferProposal.createMustFail createTransferProposalDisclosures custodianB tpFactoryKey
+    createRecord' with proposer = custodianB; preAllocationApprovalOps = [mkPreTakeDelivery custodianBAccount']
+
+  ----------------
+  --- Receiver ---
+  ----------------
+  let createRecord' = createRecord with proposer = receiver
+  -- receiver is not a custodian
+  TransferProposal.createMustFail createTransferProposalDisclosures receiver tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPreCreditReceiver]
+  -- receiver is not a custodian
+  TransferProposal.createMustFail createTransferProposalDisclosures receiver tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPreDebitSender]
+  receiverHoldingCid <- Account.credit [] euro 10.0 receiverAccount
+  -- receiver cannot pledge (only take delivery)
+  TransferProposal.createMustFail createTransferProposalDisclosures receiver tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPrePledge receiverHoldingCid]
+  -- Invalid account
+  TransferProposal.createMustFail createTransferProposalDisclosures receiver tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPreTakeDelivery senderAccount]
+
+  ----------------------
+  --- Root Custodian ---
+  ----------------------
+  let createRecord' = createRecord with proposer = rootCustodian
+  -- rootCustodian cannot credit
+  TransferProposal.createMustFail createTransferProposalDisclosures rootCustodian tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPreCreditReceiver]
+  -- rootCustodian cannot debit
+  TransferProposal.createMustFail createTransferProposalDisclosures rootCustodian tpFactoryKey
+    createRecord' with preAllocationApprovalOps = [mkPreDebitSender]
+
+  -------------------
+  --- Happy paths ---
+  -------------------
+  TransferProposal.create createTransferProposalDisclosures sender tpFactoryKey
+    createRecord with proposer = sender; preAllocationApprovalOps = [mkPrePledge senderHoldingCid]
+  TransferProposal.create createTransferProposalDisclosures custodianA tpFactoryKey
+    createRecord with proposer = custodianA; preAllocationApprovalOps = [mkPreDebitSender]
+  TransferProposal.create createTransferProposalDisclosures custodianA tpFactoryKey
+    createRecord with
+      proposer = custodianA
+      preAllocationApprovalOps = [mkPrePledge custodianAHoldingCid']
+      -- Needed since rootCustodian is a outgoing controller in custodianAAccount'
+      authorizers = Set.singleton rootCustodian
+  TransferProposal.create createTransferProposalDisclosures custodianB tpFactoryKey
+    createRecord with
+      proposer = custodianB
+      preAllocationApprovalOps = [mkPreTakeDelivery custodianBAccount']
+      -- Needed since rootCustodian is a incoming controller in custodianAAccount'
+      authorizers = Set.singleton rootCustodian
+  TransferProposal.create createTransferProposalDisclosures custodianB tpFactoryKey
+    createRecord with proposer = custodianB; preAllocationApprovalOps = [mkPreCreditReceiver]
+  TransferProposal.create createTransferProposalDisclosures receiver tpFactoryKey
+    createRecord with proposer = receiver; preAllocationApprovalOps = [mkPreTakeDelivery receiverAccount]
+  pure ()
+
+
+data TestTransferProposalData = TestTransferProposalData
+  with
+    proposer : Party
+    proposerAccount : AccountKey
+    authorizers : Parties
+    tpSignatories : Parties
+    settler : Party
+    settlers : Parties
+    quantity : InstrumentQuantity
+    hierarchy : Hierarchy
+    transferData : TransferData
+    extraBatchObservers : Parties
+    createRecord : TransferProposalFactory.Create
+
+mkTransferProposalData : TestParties -> TestInitialState -> TestTransferProposalData
+mkTransferProposalData TestParties{..} TestInitialState{..} =
+  let
+    proposer = sender
+    proposerAccount = senderAccount
+    authorizers = Set.fromList [custodianA, custodianB, issuer]
+    tpSignatories = (authorizers <> Set.singleton proposer)
+    settler = sAgent
+    settlers = Set.singleton settler
+    settlementTime = None
+    quantity = qty 10.0 euro
+    hierarchy = Hierarchy with
+      rootCustodian
+      pathsToRootCustodian = [[sender, custodianA], [receiver, custodianB]]
+    transferData = TransferData with
+      sender
+      receiver
+      quantity
+      hierarchy
+    extraBatchObservers = Set.singleton regulator
+    createRecord = TransferProposalFactory.Create with
+      proposer
+      authorizers
+      settlers
+      id = Id "transfer"
+      description = "sender --> receiver transfer"
+      settlementTime
+      transferData
+      preAllocationApprovalOps = mempty
+      extraBatchObservers
+      batchConsenters = authorizers
+      settlementFactoryCid
+   in TestTransferProposalData with ..

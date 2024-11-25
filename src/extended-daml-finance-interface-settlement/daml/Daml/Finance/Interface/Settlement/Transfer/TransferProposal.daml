@@ -1,0 +1,150 @@
+
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Daml.Finance.Interface.Settlement.Transfer.TransferProposal where
+
+import DA.Set qualified as Set (insert, member)
+
+import Daml.Finance.Interface.Holding.Holding qualified as Holding (I)
+import Daml.Finance.Interface.Settlement.Batch qualified as Batch (I)
+import Daml.Finance.Interface.Settlement.Instruction qualified as Instruction (I)
+import Daml.Finance.Interface.Settlement.Transfer.Types
+  ( Instructed
+  , PreAllocationApprovalOpType
+  , RoutedStepWithPreAllocationApprovalOpsMap
+  )
+import Daml.Finance.Interface.Types.Common.Types (Id, InstrumentQuantity, Parties)
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (I)
+
+-- | Type synonym for `TransferProposal`.
+type I = TransferProposal
+
+-- | Type synonym for `View`.
+type V = View
+
+-- | View for a `TransferProposal`.
+data View = View
+  with
+    proposer : Party
+      -- ^ The party proposing the `TransferProposal` and instructing the settlement.
+      --   This party is also responsible for the creation of the related `Batch`.
+    authorizers : Parties
+      -- ^ The parties responsible for authorizing the transfer proposal.
+      --   These parties are required to grant approval for the proposal to proceed.
+    alreadyAuthorized : Parties
+      -- ^ The parties that have already authorized the `TransferProposal` for settlement.
+      --   This field tracks which parties have granted approval.
+    settlers : Parties
+      -- ^ The parties responsible for carrying out the settlement of the `TransferProposal`.
+    id : Id
+      -- ^ An identifier for this `TransferProposal`.
+    description : Text
+      -- ^ A brief description of the `TransferProposal`, providing context or details about the transfer.
+    settlementTime : Optional Time
+      -- ^ Settlement time (if any).
+    quantity : InstrumentQuantity
+      -- ^ The quantity of the instrument being transferred in the proposal.
+      --   This field defines the amount being settled in the transfer.
+    routedStepsMap : RoutedStepWithPreAllocationApprovalOpsMap
+      -- ^ A map associating each `RoutedStep` with the related `PreAllocationApprovalOpsData`.
+      --   This provides details about the `RoutedStep`\s in the transfer and any pre-allocations or approvals.
+    instructed : Instructed
+      -- ^ Indicates whether the transfer proposal has been instructed for settlement.
+      --   This can either be `NotInstructed`, meaning the proposal is not yet instructed, or `Instructed`,
+      --   containing a reference to the related batch's `ContractId`.
+    extraBatchObservers : Parties
+      -- ^ Additional parties observing the `Batch` lifecycle, beyond the regular participants.
+      --   These parties may monitor various stages, from the creation of the `Batch` to their execution and beyond.
+    batchConsenters : Parties
+      -- ^ Parties used to consent to the creation of the `Batch` for this transfer proposal.
+      --   To cancel the `Batch`, both the proposer and the batch consenters need to provide permission.
+      --   The `batchConsenters` must be a subset of the `authorizers`.
+  deriving (Eq, Show)
+
+
+-- | Interface for a transfer proposal.
+--   A `TransferProposal` outlines the transfer of holdings between parties, along with optional pre-allocations,
+--   pre-approvals of the related instructions. Pre-allocations and pre-approvals can only be performed by the
+--   authorizers that are involved in the instructions generated. The proposal provides the structure to manage the
+--   authorization, instruction, and settlement processes of the transfer.
+--
+--   Key operations within the `TransferProposal` include:
+--   - Authorization of the proposal by relevant parties.
+--   - Instruction for settlement, including the creation of the batch and instructions.
+--   - The ability to cancel the proposal, if needed, and undo any disclosed holdings.
+--   - The settlement of the transfer, finalizing the transfer and undisclosing the holdings diclosed in case any holding was pre-allocated.
+interface TransferProposal requires Disclosure.I where
+  viewtype V
+
+  authorize : Authorize -> Update (ContractId I)
+  cancel : Cancel -> Update [ContractId Holding.I]
+  instruct : Instruct -> Update (ContractId Batch.I, [ContractId Instruction.I], ContractId I)
+  settle : Settle -> Update [ContractId Holding.I]
+
+  nonconsuming choice GetView : View
+    -- ^ Retrieves the interface view.
+    with
+      viewer : Party
+        -- ^ The party retrieving the view.
+    controller viewer
+    do
+      pure $ view this
+
+  choice Authorize : ContractId I
+    -- ^ Authorizes the `TransferProposal` for settlement or further processing.
+    --   This choice allows the `authorizer` to grant approval, including optionally providing
+    --   any pre-allocation or pre-approval operations.
+    --   Only authorizers involved in the instructions may optionally provide pre-allocations or pre-approvals.
+    with
+      authorizer : Party
+        -- ^ The party authorizing the `TransferProposal`.
+      preAllocationApprovalOps : [PreAllocationApprovalOpType]
+        -- ^ A list of optional pre-allocation or pre-approval operations associated with the `TransferProposal`.
+        --   These are optional and can be provided only by authorizers involved in the instructions.
+    controller authorizer
+    do
+      authorizer `mustBeMember` (view this).authorizers
+      authorize this arg
+
+  choice Cancel : [ContractId Holding.I]
+    -- ^ Cancels the `TransferProposal`.
+    --   This choice allows the `actor` to cancel the proposal, given that they are either the proposer
+    --   or one of the authorizers. If the `TransferProposal` was previously instructed, the associated `Batch`
+    --   and `Instructions` will also be canceled as part of the process.
+    --   The result will include the holdings that were previously disclosed, which will now be undisclosed.
+    with
+      actor : Party
+        -- ^ The party performing the cancellation.
+    controller actor
+    do
+      actor `mustBeMember` (Set.insert (view this).proposer (view this).authorizers)
+      cancel this arg
+
+  choice Instruct : (ContractId Batch.I, [ContractId Instruction.I], ContractId I)
+    -- ^ Instructs the `TransferProposal` for settlement.
+    --   This choice allows the `actor` to instruct the transfer proposal, which includes batch and instruction details.
+    --   If there are any pre-allocations or pre-approvals, the corresponding allocation and approval
+    --   will be automatically handled as part of the instruction process.
+    with
+      actor : Party
+        -- ^ The party instructing the settlement of the `TransferProposal`.
+    controller actor
+    do
+      actor `mustBeMember` ((view this).proposer `Set.insert` (view this).authorizers)
+      instruct this arg
+
+  choice Settle : [ContractId Holding.I]
+    -- ^ Settles the `TransferProposal`.
+    --   This choice allows the designated settlers to settle the `TransferProposal`, finalizing the transfer.
+    --   The result will include the previously disclosed holdings from the pre-allocation or allocation process.
+    controller (view this).settlers
+    do
+      settle this arg
+
+
+mustBeMember : Party -> Parties -> Update ()
+mustBeMember controller' validControllers =
+  assertMsg "Invalid controller" $
+    controller' `Set.member` validControllers
+

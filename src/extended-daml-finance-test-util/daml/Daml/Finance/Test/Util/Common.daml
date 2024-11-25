@@ -1,0 +1,230 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+{-# LANGUAGE AllowAmbiguousTypes #-}
+
+module Daml.Finance.Test.Util.Common where
+
+import DA.Assert ((===))
+import DA.Exception (throw)
+import DA.Optional (fromSome, isNone)
+import DA.Set qualified as Set (isSubsetOf, fromList)
+
+import Daml.Script
+
+
+-- | Create parties
+createParties : [Text] -> Script [Party]
+createParties names = mapA createParty names where
+  createParty name = allocatePartyWithHint name $ PartyIdHint name
+
+-- | This exception is used in tests where we expect an exception but it doesn't throw and this gets
+-- thrown instead. This allows for ensuring an exception was fired and if not, we can rethrow to
+-- show that the expected behaviour was not observed.
+exception TestFailureException
+  with
+    text : Text
+  where
+    message "TestFailureException(text=" <> text <> ")"
+
+-- | Takes a 'Script a' that is expected to throw a 'AssertionFailed' exception, catches said
+-- exception and then validates its message. If the exception message from the 'AssertFailed'
+-- exception does not match the expected failure message, then the test is failed. If the
+-- 'Script a' does not fail, a 'TestFailureException' is thrown which in turn is caught and
+-- rethrown thusly failing the test.
+validateAssertionFailure : Script a -> Text -> Script ()
+validateAssertionFailure assertion expectedFailureMessage =
+  try do
+    assertion
+    throw TestFailureException with
+      text = "Expected test failure succeeded - expectedFailureMessage=" <> expectedFailureMessage
+  catch
+    (AssertionFailed msg) -> msg === expectedFailureMessage
+    myTestException@(TestFailureException _) -> assertFail $ show myTestException
+
+-- | Utility for exercising interface by key (submitMulti composed with exerciseInterfaceByKey
+-- helper)
+submitExerciseInterfaceByKeyCmdHelper : forall t1 t2 t c1 k c2 b.
+  ( HasInterfaceTypeRep t2
+  , HasInterfaceTypeRep t
+  , Template t1
+  , Choice t1 c1 (ContractId t)
+  , HasKey t1 k
+  , HasLookupByKey t1 k
+  , HasFetchByKey t1 k
+  , HasMaintainer t1 k
+  , HasToAnyContractKey t1 k
+  , HasFromAnyContractKey t1 k
+  , HasTemplateTypeRep t2
+  , HasToAnyTemplate t2
+  , HasFromAnyTemplate t2
+  , HasToAnyChoice t2 c2 b
+  , HasFromAnyChoice t2 c2 b
+  , HasExercise t2 c2 b
+  )
+  => [Party] -> [Party] -> k -> c1 -> c2 -> Script b
+submitExerciseInterfaceByKeyCmdHelper actAs readAs k arg1 arg2 = do
+  cid <- submitMulti actAs readAs do exerciseByKeyCmd @t1 k arg1
+  submitMulti actAs readAs do exerciseCmd (coerceInterfaceContractId @t2 cid) arg2
+
+-- | Utility for exercising interface by key (submitMulti composed with exerciseInterfaceByKey
+-- helper)
+submitMustFailExerciseInterfaceByKeyCmdHelper : forall t1 t2 t c1 k c2 b.
+  ( HasInterfaceTypeRep t2
+  , HasInterfaceTypeRep t
+  , Template t1
+  , Choice t1 c1 (ContractId t)
+  , HasKey t1 k
+  , HasLookupByKey t1 k
+  , HasFetchByKey t1 k
+  , HasMaintainer t1 k
+  , HasToAnyContractKey t1 k
+  , HasFromAnyContractKey t1 k
+  , HasTemplateTypeRep t2
+  , HasToAnyTemplate t2
+  , HasFromAnyTemplate t2
+  , HasToAnyChoice t2 c2 b
+  , HasFromAnyChoice t2 c2 b
+  , HasExercise t2 c2 b
+  )
+  => [Party] -> [Party] -> k -> c1 -> c2 -> Script ()
+submitMustFailExerciseInterfaceByKeyCmdHelper actAs readAs k arg1 arg2 = do
+  cid <- submitMulti actAs readAs do exerciseByKeyCmd @t1 k arg1
+  submitMultiMustFail actAs readAs do exerciseCmd (coerceInterfaceContractId @t2 cid) arg2
+
+discloseReferenceAndReferred : forall r t i k.
+  ( TemplateKey r k
+  , HasAgreement r
+  , HasAgreement t
+  , Template t
+  , HasField "cid" r (ContractId i)
+  , HasFromInterface t i
+  ) => Party -> k -> Script [Disclosure]
+discloseReferenceAndReferred stakeholder k = do
+  (refCid, ref) <- fromSome <$> queryContractKey @r stakeholder k
+  refDisclosed <- fromSome <$> queryDisclosure stakeholder refCid
+  let iCid = getField @"cid" ref
+  tDisclosed <- fromSome <$> queryDisclosure stakeholder (fromInterfaceContractId @t iCid)
+  pure [refDisclosed, tDisclosed]
+
+submitExerciseInterfaceByKeyCmdWithDisclosuresHelper : forall t1 t2 t c1 k c2 b.
+  ( HasInterfaceTypeRep t2
+  , HasInterfaceTypeRep t
+  , Template t1
+  , Choice t1 c1 (ContractId t)
+  , HasKey t1 k
+  , HasLookupByKey t1 k
+  , HasFetchByKey t1 k
+  , HasMaintainer t1 k
+  , HasToAnyContractKey t1 k
+  , HasFromAnyContractKey t1 k
+  , HasTemplateTypeRep t2
+  , HasToAnyTemplate t2
+  , HasFromAnyTemplate t2
+  , HasToAnyChoice t2 c2 b
+  , HasFromAnyChoice t2 c2 b
+  , HasExercise t2 c2 b
+  )
+  => [Party] -> [Party] -> [Disclosure] -> k -> c1 -> c2 -> Script b
+submitExerciseInterfaceByKeyCmdWithDisclosuresHelper actAs readAs disclosed k arg1 arg2 = do
+  cid <- submitMultiWithDisclosures actAs readAs disclosed do exerciseByKeyCmd @t1 k arg1
+  submitMultiWithDisclosures actAs readAs disclosed do exerciseCmd (coerceInterfaceContractId @t2 cid) arg2
+
+submitMustFailExerciseInterfaceByKeyCmdWithDisclosuresHelper : forall t1 t2 t c1 k c2 b.
+  ( HasInterfaceTypeRep t2
+  , HasInterfaceTypeRep t
+  , Template t1
+  , Choice t1 c1 (ContractId t)
+  , HasKey t1 k
+  , HasLookupByKey t1 k
+  , HasFetchByKey t1 k
+  , HasMaintainer t1 k
+  , HasToAnyContractKey t1 k
+  , HasFromAnyContractKey t1 k
+  , HasTemplateTypeRep t2
+  , HasToAnyTemplate t2
+  , HasFromAnyTemplate t2
+  , HasToAnyChoice t2 c2 b
+  , HasFromAnyChoice t2 c2 b
+  , HasExercise t2 c2 b
+  )
+  => [Party] -> [Party] -> [Disclosure] -> k -> c1 -> c2 -> Script ()
+submitMustFailExerciseInterfaceByKeyCmdWithDisclosuresHelper actAs readAs disclosed k arg1 arg2 = do
+  cid <- submitMultiWithDisclosures actAs readAs disclosed do exerciseByKeyCmd @t1 k arg1
+  submitMultiWithDisclosuresMustFail actAs readAs disclosed do exerciseCmd (coerceInterfaceContractId @t2 cid) arg2
+
+discloseContract
+  : forall t i.
+  ( HasTemplateTypeRep t
+  , HasToAnyTemplate t
+  , HasFromAnyTemplate t
+  , HasAgreement t
+  , HasFromInterface t i
+  ) => Party -> ContractId i -> Script Disclosure
+discloseContract stakeholder cid =
+  fromSome <$> queryDisclosure stakeholder (fromInterfaceContractId @t cid)
+
+verifyArchivedContract
+  : forall i v p.
+  ( Template i, HasInterfaceView i v, IsParties p )
+  => p -> ContractId i -> Script ()
+verifyArchivedContract stakeholder cid =
+  assert . isNone =<<
+    queryInterfaceContractId stakeholder cid
+
+verifySignatories
+  : forall t i p.
+  ( IsParties p
+  , HasFromInterface t i
+  , HasTemplateTypeRep t
+  , HasToAnyTemplate t
+  , HasFromAnyTemplate t
+  , HasAgreement t
+  , HasSignatory t
+  ) => Party -> p -> ContractId i -> Script ()
+verifySignatories viewer expectedSignatories cid = do
+  tpl <- fromSome <$> queryContractId viewer (fromInterfaceContractId @t cid)
+  Set.fromList (toParties expectedSignatories) === Set.fromList (signatory tpl)
+
+verifyObservers
+  : forall t i p.
+  ( IsParties p
+  , HasFromInterface t i
+  , HasTemplateTypeRep t
+  , HasToAnyTemplate t
+  , HasFromAnyTemplate t
+  , HasAgreement t
+  , HasObserver t
+  ) => Party -> p -> ContractId i -> Script ()
+verifyObservers viewer expectedObservers cid = do
+  tpl <- fromSome <$> queryContractId viewer (fromInterfaceContractId @t cid)
+  Set.fromList (toParties expectedObservers) === Set.fromList (observer tpl)
+
+verifyAreObserverMembers
+  : forall t i p.
+  ( IsParties p
+  , HasFromInterface t i
+  , HasTemplateTypeRep t
+  , HasToAnyTemplate t
+  , HasFromAnyTemplate t
+  , HasAgreement t
+  , HasObserver t
+  ) => Party -> p -> ContractId i -> Script ()
+verifyAreObserverMembers viewer expectedObservers cid = do
+  tpl <- fromSome <$> queryContractId viewer (fromInterfaceContractId @t cid)
+  assert $ Set.fromList (toParties expectedObservers) `Set.isSubsetOf` Set.fromList (observer tpl)
+
+archiveContract
+  : forall t i p.
+  ( IsParties p
+  , HasFromInterface t i
+  , HasTemplateTypeRep t
+  , HasToAnyTemplate t
+  , HasFromAnyTemplate t
+  , HasExercise t Archive ()
+  , HasToAnyChoice t Archive ()
+  , HasFromAnyChoice t Archive ()
+  ) => p -> ContractId i -> Script ()
+archiveContract signatories cid =
+  submitMulti (toParties signatories) [] do
+    archiveCmd (fromInterfaceContractId @t cid)

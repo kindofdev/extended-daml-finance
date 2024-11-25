@@ -1,0 +1,105 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+{-# LANGUAGE AllowAmbiguousTypes #-}
+
+module Daml.Finance.Account.HasMandatoryHoldingObservers.Test.Account where
+
+import DA.Set qualified as Set
+
+import Daml.Finance.Holding.Factory qualified as Holding (Factory(..))
+import Daml.Finance.Holding.TransferableFungible qualified as Holding (TransferableFungible)
+import Daml.Finance.Interface.Account.HasMandatoryHoldingObservers.HasMandatoryHoldingObservers
+  ( MandatoryHoldingObservers(..)
+  , getMandatoryHoldingObservers
+  )
+import Daml.Finance.Interface.Holding.Factory qualified as HoldingFactory (Reference)
+import Daml.Finance.Interface.Holding.Transferable qualified as Transferable (I, Transfer(..))
+import Daml.Finance.Interface.Types.Common.Types (HoldingStandard(..), Id(..))
+import Daml.Finance.Test.Util.Account qualified as Account
+  ( ControlledBy(..)
+  , createAccountWithMandatoryHoldingObservers
+  , createHasMandatoryHoldingObserversFactory
+  , creditMustFail
+  , creditWithDisclosures
+  )
+import Daml.Finance.Test.Util.Common
+  ( createParties
+  , discloseReferenceAndReferred
+  , verifyObservers
+  )
+import Daml.Finance.Test.Util.Holding qualified as Holding (verifyOwnerOfHolding)
+import Daml.Finance.Test.Util.HoldingFactory (createHoldingFactory)
+import Daml.Finance.Test.Util.Instrument (originate)
+import Daml.Script
+
+-- | Test an account which has mandatory holding observers (creation, credit and holding's transfer)
+-- Additionally test how to submit commands when `Account`'s `HoldingFactory` is not public.
+test : Script ()
+test = do
+  -- Create parties
+  [ custodian
+   , investor1
+   , investor2
+   , issuer
+   , depository
+   , holdingFactoryProvider
+   , regulator
+   , publicParty
+   ] <-
+    createParties
+      [ "Custodian"
+      , "Investor1"
+      , "Investor2"
+      , "Issuer"
+      , "Depository"
+      , "HoldingFactoryProvider"
+      , "Regulator"
+      , "PublicParty"
+      ]
+  let
+    mandatoryHoldingObservers = MandatoryHoldingObservers with
+      observers = Set.singleton regulator
+      instrumentIssuerAsObserver = True
+      instrumentDepositoryAsObserver = True
+
+  -- Create account factory
+  accountFactoryCid <- toInterfaceContractId <$> Account.createHasMandatoryHoldingObserversFactory custodian []
+
+  -- Create holding factory (non-public)
+  holdingFactory <- createHoldingFactory
+    Holding.Factory with
+      provider = holdingFactoryProvider
+      id = Id "Holding Factory"
+      observers = mempty  -- non-public, we need to leverage explicit disclosure
+
+  -- Create account
+  [investor1Account, investor2Account] <- forA [investor1, investor2] $
+    Account.createAccountWithMandatoryHoldingObservers "Default Account" []
+      accountFactoryCid holdingFactory [] Account.Owner mandatoryHoldingObservers custodian
+
+  -- Originate instrument
+  now <- getTime
+  instrument <- originate depository issuer "ABC.DE" TransferableFungible "Stock" [] now
+
+  -- Credit account fails - holding factory is not public
+  Account.creditMustFail [publicParty] instrument 10.0 investor1Account
+
+  -- Credit account with diclosures
+  disclosedContracts@[_, _] <-
+    discloseReferenceAndReferred @HoldingFactory.Reference @Holding.Factory
+      holdingFactory.provider
+      holdingFactory
+  investor1HoldingCid <- Account.creditWithDisclosures disclosedContracts instrument 10.0 investor1Account
+  let mandatoryHoldingObserversAsParties = getMandatoryHoldingObservers mandatoryHoldingObservers instrument
+  verifyObservers @Holding.TransferableFungible investor1 mandatoryHoldingObserversAsParties investor1HoldingCid
+
+  -- Transfer holding
+  investor2HoldingCid <- submitMultiWithDisclosures [investor1, investor2] [] disclosedContracts do
+    exerciseCmd (fromInterfaceContractId @Transferable.I investor1HoldingCid)
+      Transferable.Transfer with
+        actors = Set.fromList [investor1, investor2]
+        newOwnerAccount = investor2Account
+  Holding.verifyOwnerOfHolding [(investor2, investor2HoldingCid)]
+  verifyObservers @Holding.TransferableFungible investor2 mandatoryHoldingObserversAsParties investor2HoldingCid
+  pure ()

@@ -1,0 +1,150 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Daml.Finance.Interface.Settlement.Transfer.Types where
+
+import DA.Map (Map)
+import DA.Map qualified as Map (fromList, values)
+import DA.List ((\\))
+
+import Daml.Finance.Interface.Holding.Holding qualified as Holding (I)
+import Daml.Finance.Interface.Settlement.Batch qualified as Batch (I)
+import Daml.Finance.Interface.Settlement.Types (RoutedStep)
+import Daml.Finance.Interface.Types.Common.Types (Parties, AccountKey, Id, InstrumentQuantity)
+
+-- | A unique key for a transfer proposal factory.
+data TransferProposalFactoryKey = TransferProposalFactoryKey
+  with
+    provider : Party
+      -- ^ Transfer proposal factory provider.
+    id : Id
+      -- ^ Unique identifier for a transfer proposal factory.
+  deriving (Eq, Ord, Show)
+
+-- | Represents the data required to perform a transfer of holdings.
+data TransferData = TransferData
+  with
+    sender : Party
+      -- ^ The sender.
+    receiver : Party
+      -- ^ The receiver.
+    quantity : InstrumentQuantity
+      -- ^ Quantity to transfer.
+    hierarchy : Hierarchy
+      -- ^ Defines the relationship between the sender, receiver, and any intermediary custodians.
+  deriving (Show, Eq)
+
+-- | Data type that describes a hierarchical account structure among multiple parties for holdings
+--   on an instrument.
+--   Note: The `Hierarchy` from daml-finance is not used here, as it is defined in an implementation package.
+data Hierarchy = Hierarchy
+  with
+    rootCustodian : Party
+      -- ^ Root custodian of the instrument.
+    pathsToRootCustodian : [[Party]]
+      -- ^ Paths from "leaf" owners to the root custodian of the instrument.
+  deriving (Eq, Show)
+
+-- | A map that associates each `RoutedStep` with its corresponding `PreAllocationApprovalOpsData`.
+type RoutedStepWithPreAllocationApprovalOpsMap =
+  Map RoutedStep PreAllocationApprovalOpsData
+
+-- | Represents pre-allocations, pre-approvals, and corresponding disclosures (accounts or holdings)
+-- for a specific `RoutedStep`.
+data PreAllocationApprovalOpsData = PreAllocationApprovalOpsData
+ with
+    optPreAllocationOp : Optional (PreAllocationOpType, SubmitterActors)
+      -- ^ Optional pre-allocation and the submitter actors (parties) required
+      --   for the subsequent allocation process.
+    optPreApprovalOp : Optional (PreApprovalOpType, SubmitterActors)
+      -- ^ Optional pre-approval and the submitter actors (parties) required
+      --   for the subsequent approval process.
+    disclosedAccounts : [DisclosedAccount]
+      -- ^ Disclosed accounts required for the subsequent allocation or approval processes.
+    disclosedHoldings : [DisclosedHolding]
+      -- ^ Disclosed holdings required for the subsequent allocation or approval processes.
+  deriving (Show, Eq, Ord)
+
+-- | Represents an account disclosed to some observers and their corresponding context.
+type DisclosedAccount = (AccountKey, (Text, Parties))
+
+-- | Represents a holding disclosed to some observers and their corresponding context.
+type DisclosedHolding = (ContractId Holding.I, (Text, Parties))
+
+-- | Describes a set of parties responsible for submitting an allocation or approval.
+type SubmitterActors = Parties
+
+-- | Creates an initial `RoutedStepWithPreAllocationApprovalOpsMap` from a list of `RoutedStep`s,
+--   with no pre-allocations, pre-approvals, disclosed accounts, or disclosed holdings.
+initializeRoutedStepMap : [RoutedStep] -> RoutedStepWithPreAllocationApprovalOpsMap
+initializeRoutedStepMap routedSteps =
+  let
+    n = length routedSteps
+    emptyData = PreAllocationApprovalOpsData None None [] []
+  in Map.fromList $ zip routedSteps (replicate n emptyData)
+
+-- | Retrieves any disclosed accounts from a `RoutedStepWithPreAllocationApprovalOpsMap`.
+getDisclosedAccounts : RoutedStepWithPreAllocationApprovalOpsMap -> [DisclosedAccount]
+getDisclosedAccounts map = mconcat $ (.disclosedAccounts) <$> Map.values map
+
+-- | Retrieves any disclosed holdings from a `RoutedStepWithPreAllocationApprovalOpsMap`.
+getDisclosedHoldings : RoutedStepWithPreAllocationApprovalOpsMap -> [DisclosedHolding]
+getDisclosedHoldings map = mconcat $ (.disclosedHoldings) <$> Map.values map
+
+-- | Retrieves the new disclosed holdings from the difference between
+--   two `RoutedStepWithPreAllocationApprovalOpsMap`s.
+getNewDisclosedHoldings
+  : RoutedStepWithPreAllocationApprovalOpsMap
+  -> RoutedStepWithPreAllocationApprovalOpsMap
+  -> [DisclosedHolding]
+getNewDisclosedHoldings oldMap newMap =
+  getDisclosedHoldings newMap \\ getDisclosedHoldings oldMap
+
+-- | Represents an operation type for either pre-allocation or pre-approval.
+--   It can either be a `PreAllocationOp` or a `PreApprovalOp`.
+data PreAllocationApprovalOpType
+  = PreAllocationOp PreAllocationOpType
+  -- ^ A pre-allocation operation, which uses a `PreAllocationOpType`.
+  | PreApprovalOp PreApprovalOpType
+  -- ^ A pre-approval operation, which uses a `PreApprovalOpType`.
+  deriving (Show, Eq, Ord)
+
+-- | Represents the different types of pre-allocation operations.
+data PreAllocationOpType
+  = PrePledge (ContractId Holding.I)
+  -- ^ A pre-pledge operation that involves a specific `ContractId` of a holding.
+  | PreCreditReceiver
+  -- ^ A pre-credit operation for the receiver, indicating a credit to the receiver's account.
+  deriving (Show, Eq, Ord)
+
+-- | Represents the different types of pre-approval operations.
+data PreApprovalOpType
+  = PreTakeDelivery AccountKey
+  -- ^ A pre-approval operation for taking delivery from a specified `AccountKey`.
+  | PreDebitSender
+  -- ^ A pre-approval operation for debiting the sender’s account.
+  deriving (Show, Eq, Ord)
+
+-- Smart constructors
+
+mkPrePledge : (ContractId Holding.I) -> PreAllocationApprovalOpType
+mkPrePledge = PreAllocationOp . PrePledge
+
+mkPreCreditReceiver : PreAllocationApprovalOpType
+mkPreCreditReceiver = PreAllocationOp PreCreditReceiver
+
+mkPreTakeDelivery : AccountKey -> PreAllocationApprovalOpType
+mkPreTakeDelivery = PreApprovalOp . PreTakeDelivery
+
+mkPreDebitSender : PreAllocationApprovalOpType
+mkPreDebitSender = PreApprovalOp PreDebitSender
+
+-- | Represents whether a transfer proposal has been instructed.
+--   It can either be `NotInstructed`, meaning no instruction is associated with the proposal,
+--   or `Instructed`, containing a `ContractId` of the related batch.
+data Instructed
+  = NotInstructed
+  -- ^ Indicates that the transfer proposal is not instructed.
+  | Instructed (ContractId Batch.I)
+  -- ^ Indicates that the transfer proposal is instructed, referencing a `ContractId` of the associated batch.
+  deriving (Show, Eq, Ord)

@@ -1,0 +1,67 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+{-# LANGUAGE AllowAmbiguousTypes #-}
+module Daml.Finance.App.Util where
+
+import DA.Tuple (thd3, snd3, fst3)
+
+import Daml.Finance.Interface.Account.HasMandatoryHoldingObservers.Factory qualified as AccountFactory (I)
+import Daml.Finance.Interface.Account.HasMandatoryHoldingObservers.HasMandatoryHoldingObservers (MandatoryHoldingObservers(..))
+import Daml.Finance.Interface.Types.Common.Types
+  ( AccountKey
+  , HoldingFactoryKey
+  )
+import Daml.Finance.Test.Util.Account qualified as Account
+  ( ControlledBy(..)
+  , createAccountWithMandatoryHoldingObservers
+  )
+import Daml.Script
+
+
+data TestParties = TestParties
+  with
+    operator : Party
+    inv1 : Party
+    inv2 : Party
+    inv3 : Party
+    bank1 : Party
+    bank2 : Party
+    csd : Party
+    issuer : Party
+    depository : Party
+    sAgent : Party
+    regulator : Party
+  deriving (Eq, Show)
+
+
+setupParties : Script TestParties
+setupParties = do
+  operator <- allocateParty "Operator"
+  inv1 <- allocateParty "Investor_1"
+  inv2 <- allocateParty "Investor_2"
+  inv3 <- allocateParty "Investor_3"
+  bank1 <- allocateParty "Bank_1"
+  bank2 <- allocateParty "Bank_2"
+  csd <- allocateParty "Central Security Depository"
+  issuer <- allocateParty "Issuer"
+  depository <- allocateParty "Depository"
+  sAgent <- allocateParty "SettlementAgent"
+  regulator <- allocateParty "Regulator"
+  pure TestParties with ..
+
+
+createAccounts
+  :  MandatoryHoldingObservers
+  -> [(Party, (ContractId AccountFactory.I, HoldingFactoryKey), [(Party, Account.ControlledBy)])]
+  -> Script [AccountKey]
+createAccounts mandatoryHoldingObservers custodiansFactoriesCustomers = do
+  let
+    custodians = fst3 <$> custodiansFactoriesCustomers
+    factories = snd3 <$> custodiansFactoriesCustomers
+    customers = thd3 <$> custodiansFactoriesCustomers
+  mconcat <$> forA (zip3 custodians factories customers)
+    \(custodian, (accountFactoryCid, holdingFactoryKey), customersPerCustodian) -> forA customersPerCustodian $
+      \(customer, controlledBy) ->
+        Account.createAccountWithMandatoryHoldingObservers "test" [] accountFactoryCid holdingFactoryKey
+          [] controlledBy mandatoryHoldingObservers custodian customer

@@ -1,0 +1,72 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Daml.Finance.Interface.Account.HasMandatoryHoldingObservers.HasMandatoryHoldingObservers where
+
+import DA.Set qualified as Set (empty, fromList, singleton)
+
+import Daml.Finance.Interface.Account.Account qualified as Account (I)
+import Daml.Finance.Interface.Types.Common.Types (InstrumentKey, Parties)
+import Daml.Finance.Interface.Util.Disclosure qualified as Disclosure (I)
+
+-- | Type synonym for `HasMandatoryHoldingObservers`.
+type I = HasMandatoryHoldingObservers
+
+-- | Type synonym for `View`.
+type V = View
+
+-- | Represents the mandatory observers for a holding.
+--   This data type specifies the parties required to observe a holding and whether the instrument's issuer
+--   and/or depository should also be included as observers.
+data MandatoryHoldingObservers = MandatoryHoldingObservers
+  with
+    observers : Parties
+      -- ^ The list of parties that are mandatory observers for the holding.
+      --   This can be an empty set if no specific parties are mandated as observers.
+    instrumentIssuerAsObserver : Bool
+      -- ^ Indicates whether the instrument's issuer is included as a mandatory observer.
+    instrumentDepositoryAsObserver : Bool
+      -- ^ Indicates whether the instrument's depository is included as a mandatory observer.
+  deriving (Eq, Show, Ord)
+
+-- | A smart constructor for `MandatoryHoldingObservers` with no mandatory observers.
+--   Represents a state where no specific parties are observing the holding,
+--   and neither the instrument's issuer nor its depository are included as observers.
+emptyMandatoryHoldingObservers : MandatoryHoldingObservers
+emptyMandatoryHoldingObservers =
+  MandatoryHoldingObservers with
+    observers = mempty
+    instrumentIssuerAsObserver = False
+    instrumentDepositoryAsObserver = False
+
+-- | Retrieves the mandatory observers parties based on the given `MandatoryHoldingObservers` and instrument.
+getMandatoryHoldingObservers : MandatoryHoldingObservers -> InstrumentKey -> Parties
+getMandatoryHoldingObservers mandatoryHoldingObservers instrument =
+  mandatoryHoldingObservers.observers <>
+    case ( mandatoryHoldingObservers.instrumentIssuerAsObserver
+         , mandatoryHoldingObservers.instrumentDepositoryAsObserver
+         ) of
+      (True, True) ->   Set.fromList [instrument.issuer, instrument.depository]
+      (True, False) ->  Set.singleton instrument.issuer
+      (False, True) ->  Set.singleton instrument.depository
+      (False, False) -> Set.empty
+
+-- | View for `HasMandatoryHoldingObservers`.
+data View = View
+  with
+    mandatoryHoldingObservers : MandatoryHoldingObservers
+      -- ^ The mandatory holding's observers.
+  deriving (Eq, Show)
+
+-- | An interface that represents an Account which sets mandatory observers on the holdings it credits.
+interface HasMandatoryHoldingObservers requires Account.I, Disclosure.I where
+  viewtype V
+
+  nonconsuming choice GetView : View
+    -- ^ Retrieves the interface view.
+    with
+      viewer : Party
+        -- ^ The party fetching the view.
+    controller viewer
+    do
+      pure $ view this

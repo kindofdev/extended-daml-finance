@@ -1,0 +1,213 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Daml.Finance.Settlement.Transfer.Util where
+
+import DA.Map qualified as Map (insertWith, toList)
+import DA.Optional (isNone, listToOptional)
+import DA.Set qualified as Set (fromList, insert, intersection, isSubsetOf, member, null, singleton)
+
+import Daml.Finance.Interface.Account.Account qualified as Account (I, R, disclose)
+import Daml.Finance.Interface.Account.Util (getAccount)
+import Daml.Finance.Interface.Holding.Holding qualified as Holding (I)
+import Daml.Finance.Interface.Holding.Util qualified as Holding (disclose, getAmount, getInstrument)
+import Daml.Finance.Interface.Settlement.Transfer.Types
+  ( DisclosedAccount
+  , DisclosedHolding
+  , PreAllocationApprovalOpsData(..)
+  , PreAllocationOpType(..)
+  , PreApprovalOpType(..)
+  , PreAllocationApprovalOpType(..)
+  , RoutedStepWithPreAllocationApprovalOpsMap
+  , PreAllocationApprovalOpsData
+  , getNewDisclosedHoldings
+  , mkPrePledge
+  )
+import Daml.Finance.Interface.Settlement.Types (RoutedStep(..))
+import Daml.Finance.Interface.Types.Common.Types (InstrumentQuantity, Parties)
+import Daml.Finance.Interface.Util.InterfaceKey (fetchInterfaceByKey)
+
+
+-- | Validates a list of pre-allocations and pre-approvals given a `RoutedStepWithPreAllocationApprovalOpsMap`.
+--   This function checks the validity of the specified pre-allocation and pre-approval operations based on the provided
+--   `routedStepsMap`, the actor (controller of the choice), and the transfer proposal's signatories.
+--   The function returns an updated `routedStepsMap` with the validated pre-allocations and pre-approvals.
+--   During the validation process, accounts and holdings are disclosed as needed, based on the operations.
+--   NOTE: This mirrors the same checks done in the default `Instruction` for Pledge,
+--   CreditReceiver, TakeDelivery, and DebitSender operations.
+validatePreAllocationApprovalOps
+  :  Party
+  -> Parties
+  -> InstrumentQuantity
+  -> RoutedStepWithPreAllocationApprovalOpsMap
+  -> [PreAllocationApprovalOpType]
+  -> Update RoutedStepWithPreAllocationApprovalOpsMap
+validatePreAllocationApprovalOps _ _ _ routedStepsMap [] = pure routedStepsMap
+validatePreAllocationApprovalOps actor tpSignatories quantity routedStepsMap (op :: rest) = do
+  (rs, (op', submitterActors), newDisclosedAccounts, newDisclosedHoldings) <-
+    validatePreAllocationApprovalOp actor tpSignatories quantity routedStepsMap op
+  let
+    newValue = PreAllocationApprovalOpsData with
+      disclosedAccounts = newDisclosedAccounts
+      disclosedHoldings = newDisclosedHoldings
+      optPreAllocationOp = case op' of
+        PreAllocationOp alloc -> Some (alloc, submitterActors)
+        PreApprovalOp _ -> None
+      optPreApprovalOp = case op' of
+        PreAllocationOp _ -> None
+        PreApprovalOp appr -> Some (appr, submitterActors)
+    routedStepsMap' = Map.insertWith insertFun rs newValue routedStepsMap
+  validatePreAllocationApprovalOps actor tpSignatories quantity routedStepsMap' rest
+  where
+    insertFun new old =
+      old with
+        optPreAllocationOp = merge old.optPreAllocationOp new.optPreAllocationOp
+        optPreApprovalOp   = merge old.optPreApprovalOp new.optPreApprovalOp
+        disclosedAccounts  = old.disclosedAccounts <> new.disclosedAccounts
+        disclosedHoldings  = old.disclosedHoldings <> new.disclosedHoldings
+      where
+        merge (Some a) None = Some a
+        merge None (Some a) = Some a
+        merge None None     = None
+        merge _ _           = error "Unexpected merge"
+
+-- | HIDE
+validatePreAllocationApprovalOp
+  : Party
+  -> Parties
+  -> InstrumentQuantity
+  -> RoutedStepWithPreAllocationApprovalOpsMap
+  -> PreAllocationApprovalOpType
+  -> Update (RoutedStep, (PreAllocationApprovalOpType, Parties), [DisclosedAccount], [DisclosedHolding])
+validatePreAllocationApprovalOp actor tpSignatories quantity routedStepsMap (PreAllocationOp (PrePledge holdingCid)) = do
+  let
+    allMustBeSignatories = mustBeSignatoriesHelper True tpSignatories
+    atLeastOneMustBeSignatory = mustBeSignatoriesHelper False tpSignatories
+  holding <- fetch holdingCid
+  let senderAccountKey = getAccount holding
+  senderAccount <- view <$>
+    fetchInterfaceByKey @Account.R @Account.I senderAccountKey
+  (routedStep, PreAllocationApprovalOpsData{optPreAllocationOp}) <-
+    abortIfNotFound "The holding provided cannot be pledged to none of the instructions generated" $
+      getRoutedStep routedStepsMap RoutedStepSearchCriteria with
+        optSender = Some senderAccount.owner
+        optCustodian = Some senderAccount.custodian
+        optReceiver = None
+  assertMsg "Submitting actor is not authorized to Pledge the holding provided to none of the instructions generated" $
+    actor `Set.member` (Set.fromList [routedStep.custodian, routedStep.sender])
+  assertMsg alreadyAllocatedMsg $ isNone optPreAllocationOp
+  allMustBeSignatories senderAccount.controllers.outgoing
+  assertMsg ("Pledged amount must match.") $
+    Holding.getAmount holding == quantity.amount
+  assertMsg ("Pledged instrument must match") $
+    Holding.getInstrument holding == quantity.unit
+  -- Disclose account
+  let observersToAdd = mkObserversToAdd tpSignatories
+  Account.disclose observersToAdd actor (Set.singleton actor) senderAccountKey
+  -- Disclose holding
+  holdingDisclosedCid <- Holding.disclose observersToAdd (Set.singleton actor) holdingCid
+  let submitterActors = Set.insert actor senderAccount.controllers.outgoing
+  pure
+    ( routedStep
+    , (mkPrePledge holdingDisclosedCid, submitterActors)
+    , [(senderAccountKey, observersToAdd)]
+    , [(holdingDisclosedCid, observersToAdd)]
+    )
+
+validatePreAllocationApprovalOp actor tpSignatories quantity routedStepsMap op@(PreAllocationOp PreCreditReceiver) = do
+  (routedStep, PreAllocationApprovalOpsData{optPreAllocationOp}) <-
+    abortIfNotFound "Submitting actor is not authorized to CreditReceiver on none of the instructions generated" $
+      getRoutedStep routedStepsMap RoutedStepSearchCriteria with
+        optSender = Some actor
+        optCustodian = Some actor
+        optReceiver = None
+  assertMsg alreadyAllocatedMsg $ isNone optPreAllocationOp
+  let submitterActors = Set.singleton actor
+  pure (routedStep, (op, submitterActors), [], [])
+
+validatePreAllocationApprovalOp actor tpSignatories quantity routedStepsMap op@(PreApprovalOp (PreTakeDelivery receiverAccountKey)) = do
+  let
+    allMustBeSignatories = mustBeSignatoriesHelper True tpSignatories
+    atLeastOneMustBeSignatory = mustBeSignatoriesHelper False tpSignatories
+  receiverAccount <- view <$>
+    fetchInterfaceByKey @Account.R @Account.I receiverAccountKey
+  (routedStep, PreAllocationApprovalOpsData{optPreApprovalOp}) <-
+    abortIfNotFound "The account provided cannot be used to take delivery on none of the instructions generated" $
+      getRoutedStep routedStepsMap RoutedStepSearchCriteria with
+        optSender = None
+        optCustodian = Some receiverAccount.custodian
+        optReceiver = Some receiverAccount.owner
+  assertMsg "Submitting actor is not authorized to TakeDelivery on the account provided" $
+    actor `Set.member` (Set.fromList [routedStep.custodian, routedStep.receiver])
+  allMustBeSignatories receiverAccount.controllers.incoming
+  assertMsg alreadyApprovedMsg $ isNone optPreApprovalOp
+  -- Disclose account
+  let observersToAdd = mkObserversToAdd tpSignatories
+  Account.disclose observersToAdd actor (Set.singleton actor) receiverAccountKey
+  let submitterActors = Set.insert actor receiverAccount.controllers.incoming
+  pure (routedStep, (op, submitterActors), [(receiverAccountKey, observersToAdd)], [])
+
+validatePreAllocationApprovalOp actor tpSignatories quantity routedStepsMap op@(PreApprovalOp PreDebitSender) = do
+  let allMustBeSignatories = mustBeSignatoriesHelper True tpSignatories
+  (routedStep, PreAllocationApprovalOpsData{optPreApprovalOp}) <-
+    abortIfNotFound "Submitting actor is not authorized to DebitSender on none of the instructions generated" $
+      getRoutedStep routedStepsMap RoutedStepSearchCriteria with
+        optSender = None
+        optCustodian = Some actor
+        optReceiver = Some actor
+  assertMsg alreadyApprovedMsg $ isNone optPreApprovalOp
+  let submitterActors = Set.singleton actor
+  pure (routedStep, (op, submitterActors), [], [])
+
+findNewDiclosedHolding
+  :  RoutedStepWithPreAllocationApprovalOpsMap
+  -> RoutedStepWithPreAllocationApprovalOpsMap
+  -> Update (Optional (ContractId Holding.I))
+findNewDiclosedHolding oldMap newMap = do
+  let newDisclosedHoldingCids = fst <$> getNewDisclosedHoldings oldMap newMap
+  assertMsg "Unexpected 2 or more new holdings disclosed" $
+    length newDisclosedHoldingCids <= 1
+  pure $ listToOptional newDisclosedHoldingCids
+
+mkObserversToAdd : Parties -> (Text, Parties)
+mkObserversToAdd parties = ("transfer-proposal-signatories", parties)
+
+alreadyAllocatedMsg : Text
+alreadyAllocatedMsg = "Invalid allocation - the corresponding instruction is already pre-allocated"
+
+alreadyApprovedMsg : Text
+alreadyApprovedMsg = "Invalid allocation - the corresponding instruction is already pre-approved"
+
+mustBeSignatoriesHelper : Bool -> Parties -> Parties -> Update ()
+mustBeSignatoriesHelper requireAllToAuthorize tpSignatories parties =
+  if requireAllToAuthorize then
+    assertMsg ("All parties in " <> show parties <> " must be in the tpSignatories set " <>
+      show tpSignatories <> ")") $ parties `Set.isSubsetOf` tpSignatories
+  else
+    assertMsg ("At least one party from " <> show parties <> " must be in the tpSignatories set "
+      <> show tpSignatories <> ".") . not . Set.null $ parties  `Set.intersection` tpSignatories
+
+abortIfNotFound : Text -> Optional a -> Update a
+abortIfNotFound errorMsg opt = case opt of
+  None -> abort errorMsg
+  Some a -> pure a
+
+getRoutedStep
+  : RoutedStepWithPreAllocationApprovalOpsMap
+  -> RoutedStepSearchCriteria
+  -> Optional (RoutedStep, PreAllocationApprovalOpsData)
+getRoutedStep routedStepsMap RoutedStepSearchCriteria{optSender; optReceiver; optCustodian} =
+  find criteriFun (Map.toList routedStepsMap)
+  where
+    criteriFun (rs, _) =
+      optional True (== rs.sender) optSender
+      && optional True (== rs.receiver) optReceiver
+      && optional True (== rs.custodian) optCustodian
+
+data RoutedStepSearchCriteria = RoutedStepSearchCriteria
+  with
+    optSender : Optional Party
+    optReceiver : Optional Party
+    optCustodian : Optional Party
+  deriving (Eq, Ord, Show)
+

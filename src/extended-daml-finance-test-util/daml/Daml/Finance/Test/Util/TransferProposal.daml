@@ -1,0 +1,145 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+{-# LANGUAGE AllowAmbiguousTypes #-}
+
+module Daml.Finance.Test.Util.TransferProposal where
+
+import Daml.Finance.Interface.Holding.Holding qualified as Holding (I)
+import Daml.Finance.Interface.Settlement.Batch qualified as Batch (I)
+import Daml.Finance.Interface.Settlement.Instruction qualified as Instruction (I)
+import Daml.Finance.Interface.Settlement.Transfer.TransferProposalFactory qualified as TransferProposalFactory
+  ( Create(..), GetCid(..), GetView(..), I, R, Reference(..), toKey )
+import Daml.Finance.Interface.Settlement.Transfer.TransferProposal qualified as TransferProposal
+  ( Authorize(..)
+  , Cancel(..)
+  , Instruct(..)
+  , I
+  , Settle(..)
+  )
+import Daml.Finance.Interface.Settlement.Transfer.Types
+  ( PreAllocationApprovalOpType(..)
+  , TransferProposalFactoryKey(..)
+  )
+import Daml.Finance.Interface.Types.Common.Types (Id(..), PartiesMap)
+import Daml.Finance.Settlement.Transfer.TransferProposalFactory qualified as TransferProposal (Factory(..))
+import Daml.Finance.Test.Util.Common
+  ( discloseReferenceAndReferred
+  , submitExerciseInterfaceByKeyCmdWithDisclosuresHelper
+  , submitMustFailExerciseInterfaceByKeyCmdWithDisclosuresHelper
+  )
+import Daml.Script
+
+
+createFactory
+  :  Text
+  -> PartiesMap
+  -> Party
+  -> Script (TransferProposalFactoryKey, Disclosure, Disclosure)
+createFactory id observers provider = do
+  cid <- toInterfaceContractId @TransferProposalFactory.I <$>
+    submit provider do
+      createCmd TransferProposal.Factory with provider; id = Id id; observers
+  factoryView <- submit provider do
+    exerciseCmd cid TransferProposalFactory.GetView with viewer = provider
+  submit provider do
+    createCmd TransferProposalFactory.Reference with factoryView; cid; observers
+  let transferProposalFactoryKey = TransferProposalFactory.toKey factoryView
+  [factoryRefDisclosed, factoryDisclosed] <-
+    discloseReferenceAndReferred @TransferProposalFactory.R @TransferProposal.Factory
+      provider
+      transferProposalFactoryKey
+  pure (transferProposalFactoryKey, factoryRefDisclosed, factoryDisclosed)
+
+settle
+  :  Party
+  -> [Disclosure]
+  -> ContractId TransferProposal.I
+  -> Script [ContractId Holding.I]
+settle settler disclosed tpCid =
+  submitWithDisclosures settler disclosed do
+    exerciseCmd tpCid TransferProposal.Settle
+
+settleMustFail
+  :  Party
+  -> [Disclosure]
+  -> ContractId TransferProposal.I
+  -> Script ()
+settleMustFail settler disclosed tpCid =
+  submitWithDisclosuresMustFail settler disclosed do
+    exerciseCmd tpCid TransferProposal.Settle
+
+create
+  : [Disclosure]
+  -> Party
+  -> TransferProposalFactoryKey
+  -> TransferProposalFactory.Create
+  -> Script (ContractId TransferProposal.I, Optional (ContractId Holding.I))
+create disclosed proposer tpFactoryKey createRecord =
+  submitExerciseInterfaceByKeyCmdWithDisclosuresHelper @TransferProposalFactory.R @TransferProposalFactory.I
+    [proposer] [] disclosed tpFactoryKey
+    TransferProposalFactory.GetCid with viewer = proposer
+    createRecord
+
+createMustFail
+  : [Disclosure]
+  -> Party
+  -> TransferProposalFactoryKey
+  -> TransferProposalFactory.Create
+  -> Script ()
+createMustFail disclosed proposer tpFactoryKey createRecord =
+  submitMustFailExerciseInterfaceByKeyCmdWithDisclosuresHelper @TransferProposalFactory.R @TransferProposalFactory.I
+    [proposer] [] disclosed tpFactoryKey
+    TransferProposalFactory.GetCid with viewer = proposer
+    createRecord
+
+cancel : Party -> ContractId TransferProposal.I -> Script [ContractId Holding.I]
+cancel actor tpCid =
+  submit actor do
+    exerciseCmd tpCid TransferProposal.Cancel with actor
+
+cancelMustFail : Party -> ContractId TransferProposal.I -> Script ()
+cancelMustFail actor tpCid =
+  submitMustFail actor do
+    exerciseCmd tpCid TransferProposal.Cancel with actor
+
+authorizeMustFail
+  : Party
+  -> [PreAllocationApprovalOpType]
+  -> ContractId TransferProposal.I
+  -> Script ()
+authorizeMustFail submitter preAllocationApprovalOps tpCid =
+  submitMustFail submitter do
+    exerciseCmd tpCid TransferProposal.Authorize with
+      authorizer = submitter
+      preAllocationApprovalOps
+
+authorize
+  : Party
+  -> [PreAllocationApprovalOpType]
+  -> ContractId TransferProposal.I
+  -> Script (ContractId TransferProposal.I)
+authorize authorizer preAllocationApprovalOps tpCid =
+  submit authorizer do
+    exerciseCmd tpCid TransferProposal.Authorize with
+      authorizer
+      preAllocationApprovalOps
+
+instructMustFail
+  : [Disclosure]
+  -> Party
+  -> ContractId TransferProposal.I
+  -> Script ()
+instructMustFail disclosed actor tpCid =
+  submitWithDisclosuresMustFail actor disclosed do
+    exerciseCmd tpCid TransferProposal.Instruct with actor
+
+instruct
+  : [Disclosure]
+  -> Party
+  -> ContractId TransferProposal.I
+  -> Script (ContractId Batch.I, [ContractId Instruction.I], ContractId TransferProposal.I)
+instruct disclosed actor tpCid = do
+  submitWithDisclosures actor disclosed do
+    exerciseCmd tpCid TransferProposal.Instruct with actor
+

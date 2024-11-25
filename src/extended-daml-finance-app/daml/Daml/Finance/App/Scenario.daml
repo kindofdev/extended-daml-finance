@@ -1,0 +1,305 @@
+-- Copyright (c) 2024  Jose Velasco (kindofdev). All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Daml.Finance.App.Scenario where
+
+import DA.Foldable (forA_)
+import DA.Functor (void)
+import DA.Set qualified as Set (fromList, singleton)
+
+import Daml.Finance.App.Util (TestParties(..), createAccounts, setupParties)
+import Daml.Finance.Holding.TransferableFungible qualified as Holding (TransferableFungible)
+import Daml.Finance.Interface.Account.HasMandatoryHoldingObservers.HasMandatoryHoldingObservers
+  ( MandatoryHoldingObservers(..)
+  , getMandatoryHoldingObservers
+  )
+import Daml.Finance.Interface.Types.Common.Types
+  ( HoldingStandard(..)
+  , Id(..)
+  )
+import Daml.Finance.Interface.Settlement.Transfer.TransferProposalFactory qualified as TransferProposalFactory (Create(..))
+import Daml.Finance.Interface.Settlement.Transfer.Types
+  ( Hierarchy(..)
+  , TransferData(..)
+  , mkPreCreditReceiver
+  , mkPreDebitSender
+  , mkPrePledge
+  , mkPreTakeDelivery
+  )
+import Daml.Finance.Interface.Util.Common (qty)
+import Daml.Finance.Settlement.Transfer.Batch (Batch)
+import Daml.Finance.Test.Util.Account qualified as Account
+  ( ControlledBy(..)
+  , credit
+  , createHasMandatoryHoldingObserversFactoryAndDiclosure
+  )
+import Daml.Finance.Test.Util.Batch qualified as Batch (createSettlementDisclosureBatchFactory, pledge)
+import Daml.Finance.Test.Util.Common (verifyObservers)
+import Daml.Finance.Test.Util.Holding qualified as Holding (verifyOwnerOfHolding)
+import Daml.Finance.Test.Util.HoldingFactory qualified as Holding (createFactoryAndDiclosures)
+import Daml.Finance.Test.Util.Instrument (originate)
+import Daml.Finance.Test.Util.TransferProposal qualified as TransferProposal
+  ( authorize
+  , create
+  , createFactory
+  , instruct
+  , settle
+  , settleMustFail
+  )
+
+import Daml.Script
+
+
+-- +------------------------------------------------+
+-- | Accounts structure                             |
+-- +------------------------------------------------+
+-- |                                                |
+-- |                       CSD                      |
+-- |                   /          \                 |
+-- |              bank1            bank2            |
+-- |             /     \             |              |
+-- |     investor1    investor2   investor3         |
+-- |                                                |
+-- +------------------------------------------------+
+-- | Extra parties                                  |
+-- +------------------------------------------------+
+-- | + issuer: intrument issuer                     |
+-- | + regulator: mandatory holding observer        |
+-- | + sAgent: settler                              |
+-- | + operator: transfer proposal factory provider |
+-- +------------------------------------------------+
+
+run : Script ()
+run = do
+  TestParties
+    { operator
+    ; inv1
+    ; inv2
+    ; inv3
+    ; bank1
+    ; bank2
+    ; csd
+    ; issuer
+    ; depository
+    ; sAgent
+    ; regulator
+    } <- setupParties
+
+  -----------------
+  --- Factories ---
+  -----------------
+  -- Transfer proposal factory
+  (tpFactoryKey, tpFactoryRefDisclosed, tpFactoryDisclosed) <-
+    TransferProposal.createFactory "test" mempty operator
+  let createTransferProposalDisclosures = [tpFactoryRefDisclosed, tpFactoryDisclosed]
+
+  -- Settlement factory
+  (settlementFactoryCid, settlementFactoryDisclosed) <-
+    Batch.createSettlementDisclosureBatchFactory mempty sAgent
+
+  -- Account factories
+  (bank1AccountFactoryCid, _) <-
+    Account.createHasMandatoryHoldingObserversFactoryAndDiclosure "accountFactoryBan1" mempty bank1
+  (bank2AccountFactoryCid, _) <-
+    Account.createHasMandatoryHoldingObserversFactoryAndDiclosure "accountFactoryBank2" mempty bank2
+  (csdAccountFactoryCid, _) <-
+    Account.createHasMandatoryHoldingObserversFactoryAndDiclosure "accountFactoryCSD" mempty csd
+
+  (holdingFactoryBank1Key, holdingFactoryRefBank1Disclosure, holdingFactoryBank1Disclosure) <-
+    Holding.createFactoryAndDiclosures "holdingFactoryBank1" mempty bank1
+  (holdingFactoryBank2Key, holdingFactoryRefBank2Disclosure, holdingFactoryBank2Disclosure) <-
+    Holding.createFactoryAndDiclosures "holdingFactoryBank2" mempty bank2
+  (holdingFactoryCSDKey, holdingFactoryRefCSDDisclosure, holdingFactoryCSDDisclosure) <-
+    Holding.createFactoryAndDiclosures "holdingFactoryCSD" mempty csd
+
+  ------------------
+  --- Instrument ---
+  ------------------
+  now <- getTime
+  equity <- originate issuer issuer "ABC" TransferableFungible "ABC equity" [] now
+
+  ----------------
+  --- Accounts ---
+  ----------------
+  let
+    mandatoryHoldingObservers = MandatoryHoldingObservers with
+      observers = Set.singleton regulator
+      instrumentIssuerAsObserver = True
+      instrumentDepositoryAsObserver = False
+    mandatoryHoldingObserversAsParties =
+      getMandatoryHoldingObservers mandatoryHoldingObservers equity
+
+  [inv1Account, inv2Account, inv3Account, bank1Account, bank2Account] <-
+    createAccounts mandatoryHoldingObservers
+      [ (bank1, (bank1AccountFactoryCid, holdingFactoryBank1Key), [ (inv1, Account.Custodian)
+                                                                  , (inv2, Account.Custodian)
+                                                                  ])
+      , (bank2, (bank2AccountFactoryCid, holdingFactoryBank2Key), [(inv3, Account.Custodian)])
+      , (csd,   (csdAccountFactoryCid, holdingFactoryCSDKey),     [ (bank1, Account.Owner)
+                                                                  , (bank2, Account.Owner)
+                                                                  ])
+      ]
+
+  ----------------
+  --- Holdings ---
+  ----------------
+  bank1HoldingCid <- Account.credit [] equity 100.0 bank1Account
+  inv1HoldingCid <- Account.credit [] equity 100.0 inv1Account
+  verifyObservers @Holding.TransferableFungible inv1 mandatoryHoldingObserversAsParties inv1HoldingCid
+
+
+
+  ----------------------------------------------------
+  ---  TRANSFER: inv1 --> inv2  (single-custodian) ---
+  ----------------------------------------------------
+  --
+  --  + inv1 as proposer
+  --  + empty extraBatchObservers
+  --  + bank1/issuer as authorizers
+  --
+  --  * inv1 (pre)pledges a holding at creation time
+  --  * bank1 (in behalf of inv2) (pre)takes delivery using inv2's account at authorization time
+  --
+  -------------------------------------------------------------------------------------------------
+
+  ---
+  --- Transfer proposal creation ---
+  ----------------------------------
+  let
+    createRecord = TransferProposalFactory.Create with
+      proposer = inv1
+      authorizers = Set.fromList [bank1, issuer]
+      settlers = Set.singleton sAgent
+      id = Id "inv1-inv2"
+      description = "inv1 to inv2 transfer (single-custodian)"
+      settlementTime = None
+      transferData = TransferData with
+        sender = inv1
+        receiver = inv2
+        quantity = qty 100.0 equity
+        hierarchy = Hierarchy with
+          rootCustodian = bank1
+          pathsToRootCustodian = [[inv1], [inv2]]
+      preAllocationApprovalOps = [mkPrePledge inv1HoldingCid]
+      extraBatchObservers = mempty
+      batchConsenters = Set.fromList [issuer, bank1]
+      settlementFactoryCid
+
+  (transferProposalCid, Some _) <-
+    TransferProposal.create createTransferProposalDisclosures inv1 tpFactoryKey createRecord
+
+  ---
+  --- Transfer proposal authorizations ---
+  ----------------------------------------
+  fullyAuthorizedTransferProposalCid <-
+    TransferProposal.authorize issuer mempty transferProposalCid
+    >>= TransferProposal.authorize bank1 [mkPreTakeDelivery inv2Account]
+
+  ---
+  --- Transfer proposal instruct ---
+  ----------------------------------
+  (batchCid, _fullyAllocatedApprovedInstructionCids@[_], instructedTransferProposalCid) <-
+    TransferProposal.instruct [settlementFactoryDisclosed] bank1 fullyAuthorizedTransferProposalCid
+  verifyObservers @Batch inv1 (Set.singleton sAgent) batchCid
+
+  ---
+  --- Transfer proposal settle ---
+  --------------------------------
+  [inv2HoldingCid] <- do
+    let settleBatchDisclosures = [holdingFactoryRefBank1Disclosure, holdingFactoryBank1Disclosure]
+    TransferProposal.settle sAgent settleBatchDisclosures instructedTransferProposalCid
+
+  -- Assert state
+  let ts = zip [inv2] [inv2HoldingCid]
+  Holding.verifyOwnerOfHolding ts
+  verifyObservers @Holding.TransferableFungible inv2 mandatoryHoldingObserversAsParties inv2HoldingCid
+
+
+
+  ---------------------------------------------------
+  ---  TRANSFER: inv2 --> inv3  (multi-custodian) ---
+  ---------------------------------------------------
+  --
+  --  + inv3 as proposer
+  --  + CSD as extraBatchObserver
+  --  + inv2/bank1/bank2/issuer as authorizers
+  --
+  --  * bank1 (pre)debits inv2 account at authorization time
+  --  * bank2:
+  --     - (pre)credits inv3's account
+  --     - (pre)takes delivery using inv3's account at authorization time
+  --     - (pre)takes delivery using bank2's account at authorization time
+  --  * inv2 (pre)pledges a holding (the one received in the previous transfer) at authorization time
+  --
+  --  # bank1 pledges a holding once transfer proposal has been instructed
+  --
+  -------------------------------------------------------------------------------------------------------------
+
+  ---
+  --- Transfer proposal creation ---
+  ----------------------------------
+  let
+    createRecord = TransferProposalFactory.Create with
+      proposer = inv3
+      authorizers = Set.fromList [inv2, bank1, bank2, issuer]
+      settlers = Set.singleton sAgent
+      id = Id "inv2-inv3"
+      description = "inv2 to inv3 transfer (multi-custodian)"
+      settlementTime = None
+      transferData = TransferData with
+        sender = inv2
+        receiver = inv3
+        quantity = qty 100.0 equity
+        hierarchy = Hierarchy with
+          rootCustodian = csd
+          pathsToRootCustodian = [[inv2, bank1], [inv3, bank2]]
+      preAllocationApprovalOps = mempty
+      extraBatchObservers = Set.singleton csd
+      batchConsenters = Set.fromList [inv2, bank1, bank2, issuer]
+      settlementFactoryCid
+
+  (transferProposalCid, None) <-
+    TransferProposal.create createTransferProposalDisclosures inv3 tpFactoryKey createRecord
+
+  ---
+  --- Transfer proposal authorizations ---
+  ----------------------------------------
+  fullyAuthorizedTransferProposalCid <-
+    TransferProposal.authorize issuer mempty transferProposalCid
+    >>= TransferProposal.authorize bank1 [ mkPreDebitSender ]
+    >>= TransferProposal.authorize bank2 [ mkPreCreditReceiver
+                                         , mkPreTakeDelivery inv3Account
+                                         , mkPreTakeDelivery bank2Account
+                                         ]
+    >>= TransferProposal.authorize inv2 [ mkPrePledge inv2HoldingCid ]
+
+  ---
+  --- Transfer proposal instruct ---
+  ----------------------------------
+  (batchCid, [i1, i2, i3], instructedTransferProposalCid) <-
+    TransferProposal.instruct [settlementFactoryDisclosed] bank2 fullyAuthorizedTransferProposalCid
+  verifyObservers @Batch inv3 (Set.fromList [sAgent, csd]) batchCid
+
+  ---
+  --- Transfer proposal settle ---
+  --------------------------------
+  transferredHoldingCids@[_, _] <- do
+    let
+      settleBatchDisclosures =
+        [ holdingFactoryRefBank2Disclosure
+        , holdingFactoryBank2Disclosure
+        , holdingFactoryRefCSDDisclosure
+        , holdingFactoryCSDDisclosure
+        ]
+    TransferProposal.settleMustFail sAgent settleBatchDisclosures instructedTransferProposalCid
+    void $ Batch.pledge bank1 bank1HoldingCid i1
+    TransferProposal.settle sAgent settleBatchDisclosures instructedTransferProposalCid
+
+  -- Assert state
+  let ts = zip [bank2, inv3] transferredHoldingCids
+  Holding.verifyOwnerOfHolding ts
+  forA_ transferredHoldingCids $
+    verifyObservers @Holding.TransferableFungible bank2 mandatoryHoldingObserversAsParties
+
+  pure ()
+
